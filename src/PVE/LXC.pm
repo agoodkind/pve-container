@@ -1675,6 +1675,47 @@ sub delete_read_restricted_options {
     return $conf;
 }
 
+# feature flags that non-root users may change with a dedicated privilege
+my $feature_flags_with_privilege = {
+    nesting => 1,
+    keyctl => 1,
+};
+
+# feature flags with a boolean value, where an absent flag equals 0
+my $boolean_feature_flags = {
+    nesting => 1,
+    keyctl => 1,
+    fuse => 1,
+    mknod => 1,
+    force_rw_sys => 1,
+};
+
+sub normalize_feature_flag_value {
+    my ($name, $value) = @_;
+
+    if ($boolean_feature_flags->{$name}) {
+        return $value ? 1 : 0;
+    }
+    return $value // '';
+}
+
+# Returns the names of all feature flags with a different semantic value in the two parsed
+# feature hashes. An absent flag and a flag set to 0 are equal.
+sub get_changed_feature_flags {
+    my ($old_features, $new_features) = @_;
+
+    my $names = {};
+    $names->{$_} = 1 for keys %$old_features, keys %$new_features;
+
+    my $changed = [];
+    for my $name (sort keys %$names) {
+        my $old = normalize_feature_flag_value($name, $old_features->{$name});
+        my $new = normalize_feature_flag_value($name, $new_features->{$name});
+        push @$changed, $name if $old ne $new;
+    }
+    return $changed;
+}
+
 sub check_ct_modify_config_perm {
     my ($rpcenv, $authuser, $vmid, $pool, $oldconf, $newconf, $delete, $unprivileged) = @_;
 
@@ -1711,51 +1752,38 @@ sub check_ct_modify_config_perm {
         } elsif ($opt eq 'nameserver' || $opt eq 'searchdomain' || $opt eq 'hostname') {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
         } elsif ($opt eq 'features') {
-            raise_perm_exc(
-                "changing feature flags for privileged container is only allowed for root\@pam")
-                if !$unprivileged;
-
-            my $nesting_changed = 0;
-            my $other_changed = 0;
+            my $old_features = {};
+            if (defined($oldconf) && $oldconf->{$opt}) {
+                $old_features = PVE::LXC::Config->parse_features($oldconf->{$opt});
+            }
+            my $new_features = {};
             if (!$delete) {
-                my $features = PVE::LXC::Config->parse_features($newconf->{$opt});
-                if (defined($oldconf) && $oldconf->{$opt}) {
-                    # existing container with features
-                    my $old_features = PVE::LXC::Config->parse_features($oldconf->{$opt});
-                    for my $feature ((keys %$old_features, keys %$features)) {
-                        my $old = $old_features->{$feature} // '';
-                        my $new = $features->{$feature} // '';
-                        if ($old ne $new) {
-                            if ($feature eq 'nesting') {
-                                $nesting_changed = 1;
-                                next;
-                            } else {
-                                $other_changed = 1;
-                                last;
-                            }
-                        }
-                    }
+                $new_features = PVE::LXC::Config->parse_features($newconf->{$opt});
+            }
+
+            my $changed_features = get_changed_feature_flags($old_features, $new_features);
+
+            my $other_changed = grep { !$feature_flags_with_privilege->{$_} } @$changed_features;
+            raise_perm_exc(
+                "changing feature flags (except nesting and keyctl) is only allowed for root\@pam"
+            ) if $other_changed;
+
+            my $nesting_changed = grep { $_ eq 'nesting' } @$changed_features;
+            if ($nesting_changed) {
+                if ($unprivileged) {
+                    # VM.Allocate was the only requirement for unprivileged containers before
+                    # VM.Config.Nesting existed and stays accepted for compatibility.
+                    $rpcenv->check_vm_perm(
+                        $authuser, $vmid, $pool, ['VM.Allocate', 'VM.Config.Nesting'], 1,
+                    );
                 } else {
-                    # new container or no features defined
-                    if (scalar(keys %$features) == 1 && exists($features->{nesting})) {
-                        $nesting_changed = 1;
-                    } elsif (scalar(keys %$features) > 0) {
-                        $other_changed = 1;
-                    }
-                }
-            } else {
-                my $features = PVE::LXC::Config->parse_features($oldconf->{$opt});
-                if (scalar(keys %$features) == 1 && exists($features->{nesting})) {
-                    $nesting_changed = 1;
-                } elsif (scalar(keys %$features) > 0) {
-                    $other_changed = 1;
+                    $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Nesting']);
                 }
             }
-            raise_perm_exc(
-                "changing feature flags (except nesting) is only allowed for root\@pam")
-                if $other_changed;
-            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Allocate'])
-                if $nesting_changed;
+
+            my $keyctl_changed = grep { $_ eq 'keyctl' } @$changed_features;
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Keyctl'])
+                if $keyctl_changed;
         } elsif ($opt eq 'hookscript') {
             # For now this is restricted to root@pam
             raise_perm_exc("changing the hookscript is only allowed for root\@pam");

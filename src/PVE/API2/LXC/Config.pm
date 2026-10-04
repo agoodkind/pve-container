@@ -106,6 +106,8 @@ my $vm_config_perm_list = [
     'VM.Config.Memory',
     'VM.Config.Network',
     'VM.Config.Options',
+    'VM.Config.Nesting',
+    'VM.Config.Keyctl',
 ];
 
 __PACKAGE__->register_method({
