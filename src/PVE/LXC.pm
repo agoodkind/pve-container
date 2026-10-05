@@ -2543,9 +2543,7 @@ my $BPF_DELEGATE_MOUNT_OPTIONS = {
     attachs => 'delegate_attachs',
 };
 
-# Reads the 'kind=name:name' arguments of the generated lxc.hook.start-host entry and returns
-# the validated name lists by kind. Other arguments, such as the ones that LXC appends, are
-# skipped.
+# LXC appends arguments that are not delegation lists. Ignore those arguments.
 sub parse_bpf_delegate_hook_args {
     my (@args) = @_;
 
@@ -2560,10 +2558,11 @@ sub parse_bpf_delegate_hook_args {
     return $lists;
 }
 
-# The bpf fs context must belong to the container user namespace. A child process enters that
-# namespace and opens the context. The parent keeps the host privileges, configures the
-# delegate_* options on a duplicate of the context, and mounts the result. The parent forks
-# first and calls setns only after the mount exists.
+# The BPF filesystem context must use the container's user namespace.
+# The child opens that context after entering the container namespaces.
+# The parent duplicates the descriptor with pidfd_getfd, sets delegate_* options,
+# and creates the mount with host privileges. It enters the container's mount
+# namespace after fsmount succeeds.
 sub bpf_delegate_mount {
     my ($lxc_pid, $lists) = @_;
 
@@ -2594,7 +2593,7 @@ sub bpf_delegate_mount {
             my $reply = "fd " . fileno($fs_context) . "\n";
             syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
 
-            # The parent closes its end of this pipe after it is done with the fs context.
+            # The child must stay alive while the parent uses the filesystem context.
             my $unused = <$release_reader>;
             $exit_code = 0;
         };
@@ -2637,11 +2636,11 @@ sub bpf_delegate_mount {
         # setns on a mount namespace needs an fs_struct that this process does not share.
         PVE::Tools::unshare($CLONE_FS) or die "unshare of the fs_struct failed: $!\n";
 
-        # The profile helper does not check the setns result. Without this check, a failed
-        # setns would mount the bpffs on the host.
+        # Verify the mount namespace after the helper calls setns.
+        # The helper does not report setns failures.
         my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
-        # The lxc-start profile allows a change to a profile named lxc-*. pve-overlay
-        # installs this profile, which allows the move mount.
+        # The lxc-start AppArmor profile permits transitions to lxc-* profiles.
+        # The lxc-pve-overlay-mount profile permits the BPF mount operation.
         $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
         my ($current_dev, $current_ino) = (stat('/proc/self/ns/mnt'))[0, 1];
         die "failed to enter the container mount namespace\n"
@@ -2664,11 +2663,9 @@ sub bpf_delegate_mount {
     return;
 }
 
-# Runs as lxc.hook.start-host. The arguments are the container ID and one 'kind=name:name'
-# argument for each list that the bpfdelegate option sets. The hook mounts a bpffs with the
-# delegate_* options at /sys/fs/bpf in the container. A failure appends a line to
-# /run/pve/ct-<vmid>.warnings, which the start task prints, and makes the hook exit with
-# status 1.
+# lxc.hook.start-host invokes this entry point with the container ID and configured lists.
+# A failure prints to stderr, attempts to append /run/pve/ct-<vmid>.warnings,
+# and exits with status 1.
 sub bpf_delegate_start_host {
     my ($vmid, @args) = @_;
 

@@ -40,7 +40,6 @@ sub check_parse_rejected {
     print "PARSE REJECTED:$value\n";
 }
 
-# A new value of undef deletes the option.
 sub run_perm_check {
     my ($user, $old_value, $new_value, $unprivileged) = @_;
 
@@ -96,7 +95,6 @@ check_parse_rejected('cmds=');
 check_parse_rejected('maps=prog_load');
 check_parse_rejected('unknown=hash');
 
-# The hook line uses the kernel syntax, which joins the names with ':'.
 my $conf = { bpfdelegate => $full_value };
 my $hook_line = PVE::LXC::make_bpf_delegate_hook_config($conf, $vmid, 1);
 my $expected_hook_line =
@@ -114,26 +112,22 @@ die "a container without bpfdelegate got a hook line\n"
 eval { PVE::LXC::make_bpf_delegate_hook_config($conf, $vmid, 0) };
 die "a privileged container got a hook line\n" if !$@;
 
-# Setting the option needs the privilege of every name.
 check_perm_ok('root@pam', undef, $full_value, 1);
 check_perm_ok('alice@pve', undef, $full_value, 1);
 check_perm_denied('bob@pve', undef, $full_value, 1);
 check_perm_denied('carol@pve', undef, $full_value, 1);
 check_perm_denied('alice@pve', undef, $full_value, 0);
 
-# A name in both the old and the new value needs no privilege.
 check_perm_ok('bob@pve', $full_value, $full_value, 1);
 check_perm_ok('carol@pve', $full_value, $full_value, 1);
 check_perm_ok('bob@pve', 'cmds=map_create', 'cmds=map_create;prog_load', 1);
 check_perm_denied('bob@pve', 'cmds=map_create', 'cmds=map_create;prog_load;btf_load', 1);
 
-# A removed name needs its privilege, and a delete removes every name.
 check_perm_denied('bob@pve', 'cmds=prog_load;map_create', 'cmds=prog_load', 1);
 check_perm_ok('alice@pve', $full_value, undef, 1);
 check_perm_denied('bob@pve', $full_value, undef, 1);
 check_perm_ok('bob@pve', 'cmds=prog_load', undef, 1);
 
-# The API level check admits a caller with any one privilege of the list.
 my $method_info = PVE::API2::LXC::Config->map_method_by_name('update_vm');
 my $api_privileges = $method_info->{permissions}->{check}->[2];
 for my $user ('bob@pve', 'carol@pve') {

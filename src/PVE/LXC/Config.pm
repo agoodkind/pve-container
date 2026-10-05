@@ -557,35 +557,32 @@ my $bpf_delegate_desc = {
         type => 'string',
         format => 'pve-lxc-bpf-delegate-cmds',
         format_description => 'cmd;cmd;...',
-        description => "BPF commands that the container may use through a BPF token."
-            . " Each value is the lowercase name of a bpf_cmd constant without the BPF_ prefix.",
+        description => "The container may execute these BPF commands using a BPF token."
+            . " Use lowercase bpf_cmd constants without the BPF_ prefix.",
     },
     maps => {
         optional => 1,
         type => 'string',
         format => 'pve-lxc-bpf-delegate-maps',
         format_description => 'maptype;maptype;...',
-        description => "BPF map types that the container may create through a BPF token."
-            . " Each value is the lowercase name of a bpf_map_type constant without the"
-            . " BPF_MAP_TYPE_ prefix.",
+        description => "The container may create these BPF map types using a BPF token."
+            . " Use lowercase bpf_map_type constants without the BPF_MAP_TYPE_ prefix.",
     },
     progs => {
         optional => 1,
         type => 'string',
         format => 'pve-lxc-bpf-delegate-progs',
         format_description => 'progtype;progtype;...',
-        description => "BPF program types that the container may load through a BPF token."
-            . " Each value is the lowercase name of a bpf_prog_type constant without the"
-            . " BPF_PROG_TYPE_ prefix.",
+        description => "The container may load these BPF program types using a BPF token."
+            . " Use lowercase bpf_prog_type constants without the BPF_PROG_TYPE_ prefix.",
     },
     attachs => {
         optional => 1,
         type => 'string',
         format => 'pve-lxc-bpf-delegate-attachs',
         format_description => 'attachtype;attachtype;...',
-        description => "BPF attach types that the container may use through a BPF token."
-            . " Each value is the lowercase name of a bpf_attach_type constant without the"
-            . " BPF_ prefix.",
+        description => "The container may use these BPF attach types using a BPF token."
+            . " Use lowercase bpf_attach_type constants without the BPF_ prefix.",
     },
 };
 
@@ -777,9 +774,9 @@ my $confdesc = {
         optional => 1,
         type => 'string',
         format => $bpf_delegate_desc,
-        description => "For unprivileged containers only: mount a bpffs with BPF token"
-            . " delegation at /sys/fs/bpf when the container starts. Every listed value"
-            . " needs its own VM.Config.BPFDelegate privilege to change.",
+        description => "Configure BPF token delegation for unprivileged containers."
+            . " The start hook mounts bpffs at /sys/fs/bpf. The API requires the corresponding"
+            . " VM.Config.BPFDelegate privilege for each listed name added or removed.",
     },
     env => {
         type => 'string',
