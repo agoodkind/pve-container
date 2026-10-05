@@ -6,6 +6,7 @@ use warnings;
 use Fcntl qw(O_RDONLY);
 
 use PVE::AbstractConfig;
+use PVE::AccessControl;
 use PVE::Cluster qw(cfs_register_file);
 use PVE::DataCenterConfig;
 use PVE::GuestHelpers;
@@ -510,6 +511,84 @@ my $features_desc = {
     },
 };
 
+sub verify_bpf_delegate_list {
+    my ($kind, $value, $noerr) = @_;
+
+    my $allowed = {};
+    for my $token (PVE::AccessControl::bpf_delegate_tokens($kind)->@*) {
+        $allowed->{$token} = 1;
+    }
+
+    my $seen = {};
+    for my $token (split(/;/, $value, -1)) {
+        if (!$allowed->{$token}) {
+            return undef if $noerr;
+            die "invalid bpf delegate $kind value '$token'\n";
+        }
+        if ($seen->{$token}++) {
+            return undef if $noerr;
+            die "duplicate bpf delegate $kind value '$token'\n";
+        }
+    }
+
+    return $value;
+}
+
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-cmds',
+    sub { return verify_bpf_delegate_list('cmds', @_) },
+);
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-maps',
+    sub { return verify_bpf_delegate_list('maps', @_) },
+);
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-progs',
+    sub { return verify_bpf_delegate_list('progs', @_) },
+);
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-attachs',
+    sub { return verify_bpf_delegate_list('attachs', @_) },
+);
+
+my $bpf_delegate_desc = {
+    cmds => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-cmds',
+        format_description => 'cmd;cmd;...',
+        description => "BPF commands that the container may use through a BPF token."
+            . " Each value is the lowercase name of a bpf_cmd constant without the BPF_ prefix.",
+    },
+    maps => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-maps',
+        format_description => 'maptype;maptype;...',
+        description => "BPF map types that the container may create through a BPF token."
+            . " Each value is the lowercase name of a bpf_map_type constant without the"
+            . " BPF_MAP_TYPE_ prefix.",
+    },
+    progs => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-progs',
+        format_description => 'progtype;progtype;...',
+        description => "BPF program types that the container may load through a BPF token."
+            . " Each value is the lowercase name of a bpf_prog_type constant without the"
+            . " BPF_PROG_TYPE_ prefix.",
+    },
+    attachs => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-attachs',
+        format_description => 'attachtype;attachtype;...',
+        description => "BPF attach types that the container may use through a BPF token."
+            . " Each value is the lowercase name of a bpf_attach_type constant without the"
+            . " BPF_ prefix.",
+    },
+};
+
 my $confdesc = {
     lock => {
         optional => 1,
@@ -693,6 +772,14 @@ my $confdesc = {
         type => 'string',
         format => $features_desc,
         description => "Allow containers access to advanced features.",
+    },
+    bpfdelegate => {
+        optional => 1,
+        type => 'string',
+        format => $bpf_delegate_desc,
+        description => "For unprivileged containers only: mount a bpffs with BPF token"
+            . " delegation at /sys/fs/bpf when the container starts. Every listed value"
+            . " needs its own VM.Config.BPFDelegate privilege to change.",
     },
     env => {
         type => 'string',
@@ -1589,6 +1676,12 @@ sub parse_features {
     my ($class, $data) = @_;
     return {} if !$data;
     return PVE::JSONSchema::parse_property_string($features_desc, $data);
+}
+
+sub parse_bpf_delegate {
+    my ($class, $data) = @_;
+    return {} if !$data;
+    return PVE::JSONSchema::parse_property_string($bpf_delegate_desc, $data);
 }
 
 sub option_exists {

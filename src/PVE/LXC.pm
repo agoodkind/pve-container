@@ -694,6 +694,30 @@ sub make_apparmor_config {
     return $raw;
 }
 
+# Generates the lxc.hook.start-host entry, which Proxmox rejects in a raw container config.
+# LXC splits the hook line like a shell and appends the container name, 'lxc', and
+# 'start-host' to the arguments.
+sub make_bpf_delegate_hook_config {
+    my ($conf, $vmid, $unprivileged) = @_;
+
+    return '' if !$conf->{bpfdelegate};
+
+    die "bpfdelegate requires an unprivileged container\n" if !$unprivileged;
+
+    my $delegate = PVE::LXC::Config->parse_bpf_delegate($conf->{bpfdelegate});
+
+    my $list_args = [];
+    for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
+        next if !$delegate->{$kind};
+        my $kernel_list = join(':', split(/;/, $delegate->{$kind}));
+        push @$list_args, "'$kind=$kernel_list'";
+    }
+    return '' if !@$list_args;
+
+    my $program = 'use PVE::LXC; PVE::LXC::bpf_delegate_start_host(@ARGV)';
+    return "lxc.hook.start-host = /usr/bin/perl -e '$program' $vmid @$list_args\n";
+}
+
 sub update_lxc_config {
     my ($vmid, $conf) = @_;
 
@@ -754,6 +778,8 @@ sub update_lxc_config {
         $raw .= "lxc.apparmor.raw = mount fstype=fuse,\n";
         $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
     }
+
+    $raw .= make_bpf_delegate_hook_config($conf, $vmid, $unprivileged);
 
     if ($unprivileged && !$features->{force_rw_sys}) {
         # unpriv. CT default to sys:rw, but that doesn't always plays well with
@@ -1716,11 +1742,34 @@ sub get_changed_feature_flags {
     return $changed;
 }
 
+# Returns the VM.Config.BPFDelegate privilege of every name that is in only one of the two
+# parsed bpfdelegate hashes.
+sub get_changed_bpf_delegate_privileges {
+    my ($old_delegate, $new_delegate) = @_;
+
+    my $privileges = [];
+    for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
+        my $old_names = {};
+        for my $name (split(/;/, $old_delegate->{$kind} // '')) {
+            $old_names->{$name} = 1;
+        }
+        my $new_names = {};
+        for my $name (split(/;/, $new_delegate->{$kind} // '')) {
+            $new_names->{$name} = 1;
+        }
+
+        for my $name (@{ PVE::AccessControl::bpf_delegate_tokens($kind) }) {
+            next if !!$old_names->{$name} == !!$new_names->{$name};
+            push @$privileges, PVE::AccessControl::bpf_delegate_privilege($kind, $name);
+        }
+    }
+    return $privileges;
+}
+
 sub check_ct_modify_config_perm {
     my ($rpcenv, $authuser, $vmid, $pool, $oldconf, $newconf, $delete, $unprivileged) = @_;
 
     return 1 if $authuser eq 'root@pam';
-    my $storage_cfg = PVE::Storage::config();
 
     my $check = sub {
         my ($opt, $delete) = @_;
@@ -1737,6 +1786,8 @@ sub check_ct_modify_config_perm {
                 my $sid = $1;
                 $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
             } else {
+                # Read the storage config only here. The read needs the cluster file system.
+                my $storage_cfg = PVE::Storage::config();
                 PVE::Storage::check_volume_access(
                     $rpcenv, $authuser, $storage_cfg, $vmid, $volid, 'rootdir',
                 );
@@ -1784,6 +1835,21 @@ sub check_ct_modify_config_perm {
             my $keyctl_changed = grep { $_ eq 'keyctl' } @$changed_features;
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Keyctl'])
                 if $keyctl_changed;
+        } elsif ($opt eq 'bpfdelegate') {
+            raise_perm_exc("bpfdelegate is only allowed for unprivileged containers")
+                if !$unprivileged && !$delete;
+
+            my $old_delegate = {};
+            if (defined($oldconf) && $oldconf->{$opt}) {
+                $old_delegate = PVE::LXC::Config->parse_bpf_delegate($oldconf->{$opt});
+            }
+            my $new_delegate = {};
+            if (!$delete) {
+                $new_delegate = PVE::LXC::Config->parse_bpf_delegate($newconf->{$opt});
+            }
+
+            my $privileges = get_changed_bpf_delegate_privileges($old_delegate, $new_delegate);
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, $privileges) if @$privileges;
         } elsif ($opt eq 'hookscript') {
             # For now this is restricted to root@pam
             raise_perm_exc("changing the hookscript is only allowed for root\@pam");
@@ -2464,6 +2530,169 @@ sub device_passthrough_hotplug : prototype($$$) {
     run_command([
         "lxc-cgroup", "-n", $vmid, "devices.allow", "$device_type $major:$minor $allow_perms",
     ]);
+}
+
+my $CLONE_FS = 0x0000_0200;
+my $SYS_PIDFD_OPEN = 434;
+my $SYS_PIDFD_GETFD = 438;
+my $BPF_DELEGATE_MOUNT_TARGET = '/sys/fs/bpf';
+my $BPF_DELEGATE_MOUNT_OPTIONS = {
+    cmds => 'delegate_cmds',
+    maps => 'delegate_maps',
+    progs => 'delegate_progs',
+    attachs => 'delegate_attachs',
+};
+
+# Reads the 'kind=name:name' arguments of the generated lxc.hook.start-host entry and returns
+# the validated name lists by kind. Other arguments, such as the ones that LXC appends, are
+# skipped.
+sub parse_bpf_delegate_hook_args {
+    my (@args) = @_;
+
+    my $lists = {};
+    for my $arg (@args) {
+        next if $arg !~ m/^(cmds|maps|progs|attachs)=([a-z0-9_:]+)\z/;
+        my ($kind, $kernel_list) = ($1, $2);
+        my $config_list = join(';', split(/:/, $kernel_list));
+        PVE::LXC::Config::verify_bpf_delegate_list($kind, $config_list);
+        $lists->{$kind} = $kernel_list;
+    }
+    return $lists;
+}
+
+# The bpf fs context must belong to the container user namespace. A child process enters that
+# namespace and opens the context. The parent keeps the host privileges, configures the
+# delegate_* options on a duplicate of the context, and mounts the result. The parent forks
+# first and calls setns only after the mount exists.
+sub bpf_delegate_mount {
+    my ($lxc_pid, $lists) = @_;
+
+    sysopen(my $ct_user_ns, "/proc/$lxc_pid/ns/user", O_RDONLY)
+        or die "failed to open user namespace of init process $lxc_pid: $!\n";
+    sysopen(my $ct_mnt_ns, "/proc/$lxc_pid/ns/mnt", O_RDONLY)
+        or die "failed to open mount namespace of init process $lxc_pid: $!\n";
+
+    pipe(my $reply_reader, my $reply_writer) or die "pipe failed: $!\n";
+    pipe(my $release_reader, my $release_writer) or die "pipe failed: $!\n";
+
+    my $child_pid = fork();
+    die "fork failed: $!\n" if !defined($child_pid);
+
+    if ($child_pid == 0) {
+        close($reply_reader);
+        close($release_writer);
+
+        my $exit_code = 1;
+        eval {
+            PVE::Tools::setns(fileno($ct_user_ns), PVE::Tools::CLONE_NEWUSER)
+                or die "failed to enter the container user namespace: $!\n";
+            PVE::Tools::setns(fileno($ct_mnt_ns), PVE::Tools::CLONE_NEWNS)
+                or die "failed to enter the container mount namespace: $!\n";
+            my $fs_context = PVE::Tools::fsopen('bpf', &FSOPEN_CLOEXEC)
+                or die "fsopen of bpf failed: $!\n";
+
+            my $reply = "fd " . fileno($fs_context) . "\n";
+            syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
+
+            # The parent closes its end of this pipe after it is done with the fs context.
+            my $unused = <$release_reader>;
+            $exit_code = 0;
+        };
+        if (my $err = $@) {
+            syswrite($reply_writer, "error $err");
+        }
+        POSIX::_exit($exit_code);
+    }
+
+    close($reply_writer);
+    close($release_reader);
+
+    my $result = eval {
+        my $reply = <$reply_reader>;
+        die "the child process exited before it opened the bpf fs context\n"
+            if !defined($reply);
+        chomp($reply);
+        die "child process: $1\n" if $reply =~ m/^error (.*)\z/;
+        die "unexpected reply '$reply' from the child process\n" if $reply !~ m/^fd (\d+)\z/;
+        my $child_fd = int($1);
+
+        my $child_pidfd = PVE::Syscall::file_handle_result(syscall($SYS_PIDFD_OPEN, $child_pid, 0))
+            or die "pidfd_open of child process $child_pid failed: $!\n";
+        my $fs_context = PVE::Syscall::file_handle_result(
+            syscall($SYS_PIDFD_GETFD, fileno($child_pidfd), $child_fd, 0),
+        ) or die "pidfd_getfd of the bpf fs context failed: $!\n";
+
+        for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
+            next if !$lists->{$kind};
+            my $option = $BPF_DELEGATE_MOUNT_OPTIONS->{$kind};
+            my $value = $lists->{$kind};
+            PVE::Tools::fsconfig(fileno($fs_context), &FSCONFIG_SET_STRING, $option, $value, 0)
+                or die "fsconfig $option=$value failed: $!\n";
+        }
+        PVE::Tools::fsconfig(fileno($fs_context), &FSCONFIG_CMD_CREATE, 0, 0, 0)
+            or die "fsconfig create of the bpf fs context failed: $!\n";
+        my $mount_fd = PVE::Tools::fsmount(fileno($fs_context), &FSMOUNT_CLOEXEC, 0)
+            or die "fsmount of the bpf fs context failed: $!\n";
+
+        # setns on a mount namespace needs an fs_struct that this process does not share.
+        PVE::Tools::unshare($CLONE_FS) or die "unshare of the fs_struct failed: $!\n";
+
+        # The profile helper does not check the setns result. Without this check, a failed
+        # setns would mount the bpffs on the host.
+        my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
+        # The lxc-start profile allows a change to a profile named lxc-*. pve-overlay
+        # installs this profile, which allows the move mount.
+        $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
+        my ($current_dev, $current_ino) = (stat('/proc/self/ns/mnt'))[0, 1];
+        die "failed to enter the container mount namespace\n"
+            if $ns_dev != $current_dev || $ns_ino != $current_ino;
+
+        my $target = $BPF_DELEGATE_MOUNT_TARGET;
+        PVE::Tools::move_mount(
+            fileno($mount_fd), '', &AT_FDCWD, $target, &MOVE_MOUNT_F_EMPTY_PATH,
+        ) or die "move_mount to $target failed: $!\n";
+        1;
+    };
+    my $err = $@;
+
+    close($release_writer);
+    waitpid($child_pid, 0);
+    my $child_status = $?;
+
+    die $err if !$result;
+    die "child process exited with status $child_status\n" if $child_status != 0;
+    return;
+}
+
+# Runs as lxc.hook.start-host. The arguments are the container ID and one 'kind=name:name'
+# argument for each list that the bpfdelegate option sets. The hook mounts a bpffs with the
+# delegate_* options at /sys/fs/bpf in the container. A failure appends a line to
+# /run/pve/ct-<vmid>.warnings, which the start task prints, and makes the hook exit with
+# status 1.
+sub bpf_delegate_start_host {
+    my ($vmid, @args) = @_;
+
+    eval {
+        my $lxc_pid = $ENV{LXC_PID};
+        die "LXC_PID is not set\n" if !defined($lxc_pid) || $lxc_pid !~ m/^(\d+)\z/;
+        $lxc_pid = int($1);
+
+        my $lists = parse_bpf_delegate_hook_args(@args);
+        bpf_delegate_mount($lxc_pid, $lists);
+    };
+    if (my $err = $@) {
+        chomp($err);
+        my $message = "bpfdelegate: $err\n";
+        print STDERR $message;
+        if (defined($vmid) && $vmid =~ m/^(\d+)\z/) {
+            my $warnings_file = "/run/pve/ct-$1.warnings";
+            if (open(my $fh, '>>', $warnings_file)) {
+                print {$fh} $message;
+                close($fh);
+            }
+        }
+        exit(1);
+    }
 }
 
 sub mountpoint_hotplug : prototype($$$$$) {
