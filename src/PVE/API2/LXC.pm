@@ -8,7 +8,7 @@ use File::Path qw(make_path remove_tree);
 use IO::Select;
 use IO::Socket::UNIX;
 use MIME::Base64 qw(decode_base64 encode_base64);
-use POSIX qw(WNOHANG);
+use POSIX qw(WNOHANG SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 use Socket qw(SOCK_STREAM);
 use Time::HiRes qw();
 use JSON;
@@ -3468,6 +3468,7 @@ __PACKAGE__->register_method({
     method => 'POST',
     protected => 1,
     proxyto => 'node',
+    expose_credentials => 1,
     permissions => {
         check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
     },
@@ -3519,6 +3520,16 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        # rest_handler stores the authenticated user of this request in the credentials
+        # immediately before it calls the method. The user of the environment can belong to
+        # another request or be empty, because auth_handler sets it before the body arrives and
+        # every request clears it.
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $credentials = $rpcenv->get_credentials(1) // {};
+        my $authuser = $credentials->{userid};
+        die "the authenticated user of the request is not available to exec\n"
+            if !defined($authuser);
+
         my $vmid = $untaint_decimal->('vmid', $param->{vmid});
         my $input;
         if (defined($param->{'input-data'})) {
@@ -3532,17 +3543,29 @@ __PACKAGE__->register_method({
         $remove_expired_exec_results->();
         my $exec_id = $create_exec_directory->($vmid);
 
-        my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
-
-        $rpcenv->fork_worker(
-            'lxcexec',
-            $vmid,
-            $authuser,
-            sub {
-                $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
-            },
-        );
+        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
+        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
+        # fork_worker returns, and the signal arrives afterwards.
+        my $sigchld = POSIX::SigSet->new(SIGCHLD);
+        my $previous_signals = POSIX::SigSet->new();
+        sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
+            or die "unable to block SIGCHLD: $!\n";
+        eval {
+            $rpcenv->fork_worker(
+                'lxcexec',
+                $vmid,
+                $authuser,
+                sub {
+                    # The worker inherits the blocked signal and unblocks it before starting
+                    # lxc-attach.
+                    sigprocmask(SIG_UNBLOCK, $sigchld);
+                    $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
+                },
+            );
+        };
+        my $fork_error = $@;
+        sigprocmask(SIG_SETMASK, $previous_signals);
+        die $fork_error if $fork_error;
 
         return { pid => 0 + $exec_id };
     },
