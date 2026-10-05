@@ -3556,8 +3556,8 @@ __PACKAGE__->register_method({
                 $vmid,
                 $authuser,
                 sub {
-                    # The worker inherits the blocked signal, and lxc-attach inherits it
-                    # from the worker.
+                    # The worker inherits the blocked signal and unblocks it before starting
+                    # lxc-attach.
                     sigprocmask(SIG_UNBLOCK, $sigchld);
                     $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
                 },

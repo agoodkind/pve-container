@@ -71,7 +71,7 @@ sub process_user {
 # One process: calls exec repeatedly, then polls every started command until it exits.
 # rest_handler stores the user of the request in the credentials before it calls the method.
 # The user of the environment is empty on every second call and belongs to another request on
-# the other calls, the states that concurrent requests leave in a pvedaemon process.
+# the other calls. Concurrent requests in one pvedaemon process produce both states.
 sub run_process {
     my ($write_handle, $index) = @_;
 
@@ -122,6 +122,7 @@ sub run_process {
     print {$write_handle} encode_json({ started => scalar(@started), errors => \@errors }), "\n";
 }
 
+my $test_start = time();
 my @readers;
 my @pids;
 for my $index (1 .. $PROCESS_COUNT) {
@@ -150,11 +151,13 @@ for my $index (0 .. $#pids) {
     push @all_errors, @{ $summary->{errors} };
 }
 
-# The UPID of every task records the user of the request that started it.
+# The UPID of every task records the user of the request that started it. The count includes
+# only the exec tasks of this run.
 my %tasks_per_user;
 for my $log (glob('/var/log/pve/tasks/*/UPID*')) {
     my $upid = PVE::UPID::decode(basename($log));
-    next if !$upid || $upid->{type} ne 'lxcexec';
+    next if !$upid || $upid->{type} ne 'lxcexec' || $upid->{id} ne $VMID;
+    next if $upid->{starttime} < $test_start;
     $tasks_per_user{ $upid->{user} }++;
 }
 for my $index (1 .. $PROCESS_COUNT) {
