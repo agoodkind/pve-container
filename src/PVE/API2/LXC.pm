@@ -3468,6 +3468,7 @@ __PACKAGE__->register_method({
     method => 'POST',
     protected => 1,
     proxyto => 'node',
+    expose_credentials => 1,
     permissions => {
         check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
     },
@@ -3519,6 +3520,16 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
+        # rest_handler stores the authenticated user of this request in the credentials
+        # immediately before it calls the method. The user of the environment can belong to
+        # another request or be empty, because auth_handler sets it before the body arrives and
+        # every request clears it.
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $credentials = $rpcenv->get_credentials(1) // {};
+        my $authuser = $credentials->{userid};
+        die "the authenticated user of the request is not available to exec\n"
+            if !defined($authuser);
+
         my $vmid = $untaint_decimal->('vmid', $param->{vmid});
         my $input;
         if (defined($param->{'input-data'})) {
@@ -3531,11 +3542,6 @@ __PACKAGE__->register_method({
         $assert_container_running->($vmid);
         $remove_expired_exec_results->();
         my $exec_id = $create_exec_directory->($vmid);
-
-        my $rpcenv = PVE::RPCEnvironment::get();
-        # A request that ends in the same pvedaemon process clears the user of the environment.
-        # The task label is root@pam in that case, the user that runs the method.
-        my $authuser = $rpcenv->get_user(1) // 'root@pam';
 
         # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
         # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until

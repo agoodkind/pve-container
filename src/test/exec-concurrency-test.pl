@@ -10,6 +10,7 @@ use strict;
 use warnings;
 
 use Cwd qw(abs_path);
+use File::Basename qw(basename);
 use File::Path qw(make_path);
 use File::Temp qw(tempdir);
 use JSON;
@@ -25,11 +26,12 @@ use PVE::LXC;
 use PVE::LXC::Config;
 use PVE::ProcFSTools;
 use PVE::RPCEnvironment;
+use PVE::UPID;
 
 my $PROCESS_COUNT = 4;
 my $CALLS_PER_PROCESS = 15;
 my $VMID = 9004;
-my $TOKEN_USER = 'svc@pve!deploy';
+my $OTHER_USER = 'other@pve!t1';
 my $POLL_SECONDS = 30;
 
 {
@@ -60,25 +62,34 @@ make_path('/var/log/pve/tasks');
 my $exec_info = PVE::API2::LXC->map_method_by_name('exec');
 my $status_info = PVE::API2::LXC->map_method_by_name('exec_status');
 
+sub process_user {
+    my ($index) = @_;
+
+    return "svc${index}\@pve!deploy";
+}
+
 # One process: calls exec repeatedly, then polls every started command until it exits.
-# Every second call runs with no user in the environment, the state that follows a request
-# that cleared the user.
+# rest_handler stores the user of the request in the credentials before it calls the method.
+# The user of the environment is empty on every second call and belongs to another request on
+# the other calls, the states that concurrent requests leave in a pvedaemon process.
 sub run_process {
-    my ($write_handle) = @_;
+    my ($write_handle, $index) = @_;
 
     my $rpcenv = PVE::RPCEnvironment->init('priv');
     my @started;
     my @errors;
     for my $call (1 .. $CALLS_PER_PROCESS) {
         if ($call % 2) {
-            $rpcenv->set_user($TOKEN_USER);
+            $rpcenv->set_user($OTHER_USER);
         } else {
             $rpcenv->set_user(undef);
         }
+        $rpcenv->set_credentials({ userid => process_user($index) });
         my $result = eval {
             $exec_info->{code}->({ vmid => $VMID, command => ['true'], timeout => 30 });
         };
         $rpcenv->set_user(undef);
+        $rpcenv->set_credentials(undef);
         if (my $error = $@) {
             chomp($error);
             push @errors, $error;
@@ -98,6 +109,16 @@ sub run_process {
         push @errors, "command $pid did not exit" if !$exited;
     }
 
+    # A request without credentials gets an error and no task under another user.
+    $rpcenv->set_user($OTHER_USER);
+    my $without_credentials = eval {
+        $exec_info->{code}->({ vmid => $VMID, command => ['true'], timeout => 30 });
+    };
+    $rpcenv->set_user(undef);
+    if ($without_credentials || $@ !~ m/authenticated user of the request is not available/) {
+        push @errors, 'exec without credentials did not fail with the user error';
+    }
+
     print {$write_handle} encode_json({ started => scalar(@started), errors => \@errors }), "\n";
 }
 
@@ -108,7 +129,7 @@ for my $index (1 .. $PROCESS_COUNT) {
     my $pid = fork() // die "fork failed: $!\n";
     if (!$pid) {
         close($reader);
-        run_process($writer);
+        run_process($writer, $index);
         close($writer);
         POSIX::_exit(0);
     }
@@ -127,6 +148,25 @@ for my $index (0 .. $#pids) {
     my $summary = decode_json($line);
     $started_total += $summary->{started};
     push @all_errors, @{ $summary->{errors} };
+}
+
+# The UPID of every task records the user of the request that started it.
+my %tasks_per_user;
+for my $log (glob('/var/log/pve/tasks/*/UPID*')) {
+    my $upid = PVE::UPID::decode(basename($log));
+    next if !$upid || $upid->{type} ne 'lxcexec';
+    $tasks_per_user{ $upid->{user} }++;
+}
+for my $index (1 .. $PROCESS_COUNT) {
+    my $user = process_user($index);
+    my $count = $tasks_per_user{$user} // 0;
+    print "tasks of $user: $count\n";
+    push @all_errors, "$user has $count tasks, expected $CALLS_PER_PROCESS"
+        if $count != $CALLS_PER_PROCESS;
+}
+for my $user (sort keys %tasks_per_user) {
+    next if $user =~ m/\Asvc\d+\@pve!deploy\z/;
+    push @all_errors, "unexpected task user $user";
 }
 
 my $expected_total = $PROCESS_COUNT * $CALLS_PER_PROCESS;
