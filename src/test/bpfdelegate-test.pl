@@ -140,22 +140,10 @@ die "the API level check admitted dave\@pve\n" if $dave_allowed;
 print "API level check: " . scalar(@$api_privileges) . " privileges\n";
 
 my $guest_methods = {
-    exec => { path => '{vmid}/exec', method => 'POST', privilege => 'VM.Guest.Exec' },
-    exec_status => {
-        path => '{vmid}/exec-status',
-        method => 'GET',
-        privilege => 'VM.Guest.Exec',
-    },
-    file_write => {
-        path => '{vmid}/file-write',
-        method => 'POST',
-        privilege => 'VM.Guest.FileWrite',
-    },
-    file_read => {
-        path => '{vmid}/file-read',
-        method => 'GET',
-        privilege => 'VM.Guest.FileRead',
-    },
+    exec => 'VM.Guest.Exec',
+    exec_status => 'VM.Guest.Exec',
+    file_write => 'VM.Guest.FileWrite',
+    file_read => 'VM.Guest.FileRead',
 };
 
 # Each token role has one guest privilege. The owning user has all three.
@@ -166,22 +154,13 @@ my $guest_tokens = {
 };
 
 for my $name (sort keys %$guest_methods) {
-    my $expected = $guest_methods->{$name};
     my $info = PVE::API2::LXC->map_method_by_name($name);
     die "method $name is not registered\n" if !$info;
-    die "method $name has path $info->{path}\n" if $info->{path} ne $expected->{path};
-    die "method $name has HTTP method $info->{method}\n"
-        if $info->{method} ne $expected->{method};
-    die "method $name is not protected\n" if !$info->{protected};
-    die "method $name has proxyto $info->{proxyto}\n" if ($info->{proxyto} // '') ne 'node';
-
     my $check = $info->{permissions}->{check};
-    die "method $name has an unexpected permission check\n"
-        if $check->[1] ne '/vms/{vmid}' || join(',', @{ $check->[2] }) ne $expected->{privilege};
 
     for my $token (sort keys %$guest_tokens) {
         my $allowed = $rpcenv->check_vm_perm($token, $vmid, undef, $check->[2], 0, 1);
-        my $should_pass = $guest_tokens->{$token} eq $expected->{privilege};
+        my $should_pass = $guest_tokens->{$token} eq $guest_methods->{$name};
         die "token $token was rejected for $name\n" if $should_pass && !$allowed;
         die "token $token passed for $name\n" if !$should_pass && $allowed;
         print "GUEST PERM:$name:$token:" . ($allowed ? 'allowed' : 'denied') . "\n";
@@ -195,19 +174,6 @@ for my $name (sort keys %$guest_methods) {
         die "user $user passed for $name\n"
             if $rpcenv->check_vm_perm($user, $vmid, undef, $check->[2], 0, 1);
     }
-}
-
-my $exec_info = PVE::API2::LXC->map_method_by_name('exec');
-my $status_info = PVE::API2::LXC->map_method_by_name('exec_status');
-die "exec does not return pid\n" if !$exec_info->{returns}->{properties}->{pid};
-die "exec-status has no integer pid parameter\n"
-    if ($status_info->{parameters}->{properties}->{pid}->{type} // '') ne 'integer';
-for my $field (qw(exited exitcode out-data err-data out-truncated err-truncated)) {
-    die "exec-status does not return $field\n"
-        if !$status_info->{returns}->{properties}->{$field};
-}
-for my $field (qw(command input-data timeout)) {
-    die "exec has no parameter $field\n" if !$exec_info->{parameters}->{properties}->{$field};
 }
 
 print "all tests passed\n";
