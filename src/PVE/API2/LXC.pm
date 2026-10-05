@@ -7,11 +7,9 @@ use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC O_RDONLY);
 use File::Path qw(make_path remove_tree);
 use IO::Select;
 use IO::Socket::UNIX;
-use IPC::Open3;
 use MIME::Base64 qw(decode_base64 encode_base64);
 use POSIX qw(WNOHANG);
 use Socket qw(SOCK_STREAM);
-use Symbol qw(gensym);
 use Time::HiRes qw();
 use JSON;
 
@@ -3152,17 +3150,61 @@ my $assert_container_running = sub {
     die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
 };
 
+# Sends TERM, then KILL after the grace period, to the process group of lxc-attach. A command
+# that calls setsid itself leaves the group and keeps running.
 my $terminate_attach_process = sub {
     my ($pid) = @_;
 
-    kill('TERM', $pid);
+    kill('TERM', -$pid);
+    my $reaped = 0;
     my $grace_deadline = Time::HiRes::time() + $GUEST_KILL_GRACE_SECONDS;
     while (Time::HiRes::time() < $grace_deadline) {
-        return if waitpid($pid, WNOHANG) != 0;
+        $reaped = 1 if !$reaped && waitpid($pid, WNOHANG) != 0;
+        # The kernel keeps the group number in use while a member exists. The check of the
+        # group ends when the last member has exited.
+        return if $reaped && !kill(0, -$pid);
         Time::HiRes::usleep($GUEST_POLL_MICROSECONDS);
     }
-    kill('KILL', $pid);
-    waitpid($pid, 0);
+    kill('KILL', -$pid);
+    waitpid($pid, 0) if !$reaped;
+};
+
+# Starts lxc-attach as the leader of a new process group. A timeout then signals the command
+# and the processes that it forks. Returns the process ID and the handles for the standard
+# input, output, and error of the process.
+my $start_attach_process = sub {
+    my ($attach_command) = @_;
+
+    pipe(my $stdin_read, my $stdin_write) or die "pipe failed: $!\n";
+    pipe(my $stdout_read, my $stdout_write) or die "pipe failed: $!\n";
+    pipe(my $stderr_read, my $stderr_write) or die "pipe failed: $!\n";
+
+    my $pid = fork();
+    die "fork failed: $!\n" if !defined($pid);
+
+    if (!$pid) {
+        # An ignored signal stays ignored after exec, and the command in the container must
+        # start with the default handling.
+        for my $signal (qw(PIPE TTOU INT QUIT TERM)) {
+            $SIG{$signal} = 'DEFAULT';
+        }
+        setpgrp(0, 0);
+        close($stdin_write);
+        close($stdout_read);
+        close($stderr_read);
+        open(STDIN, '<&', $stdin_read) or POSIX::_exit(126);
+        open(STDOUT, '>&', $stdout_write) or POSIX::_exit(126);
+        open(STDERR, '>&', $stderr_write) or POSIX::_exit(126);
+        exec { $attach_command->[0] } @$attach_command or do {
+            print STDERR "unable to execute $attach_command->[0]: $!\n";
+            POSIX::_exit(127);
+        };
+    }
+
+    close($stdin_read);
+    close($stdout_write);
+    close($stderr_write);
+    return ($pid, $stdin_write, $stdout_read, $stderr_read);
 };
 
 # Starts the command with lxc-attach as root, the process that pct exec starts. Output is
@@ -3182,9 +3224,8 @@ my $run_in_container = sub {
 
     my $attach_command = ['lxc-attach', '-n', $vmid, '--clear-env', '--', @$command];
 
-    my ($stdin_handle, $stdout_handle);
-    my $stderr_handle = gensym();
-    my $pid = open3($stdin_handle, $stdout_handle, $stderr_handle, @$attach_command);
+    my ($pid, $stdin_handle, $stdout_handle, $stderr_handle) =
+        $start_attach_process->($attach_command);
 
     my $stdout_fileno = fileno($stdout_handle);
     my $read_select = IO::Select->new($stdout_handle, $stderr_handle);
@@ -3378,7 +3419,9 @@ my $run_exec_worker = sub {
         PVE::Tools::file_set_contents("$directory/stdout", $captured->{stdout}, 0600);
         PVE::Tools::file_set_contents("$directory/stderr", $captured->{stderr}, 0600);
 
-        $status->{exitcode} = $exitcode;
+        # JSON encodes a number that Perl also used as a string, such as the exit code 124 in
+        # a message, as a JSON string. The addition returns a plain number.
+        $status->{exitcode} = 0 + $exitcode;
         $status->{'out-truncated'} = 1 if $truncated->{stdout};
         $status->{'err-truncated'} = 1 if $truncated->{stderr};
         $status->{'timed-out'} = 1 if $timed_out;
@@ -3389,6 +3432,9 @@ my $run_exec_worker = sub {
     }
 
     PVE::Tools::file_set_contents("$directory/status", encode_json($status), 0600);
+
+    # The task ends with an error status after exec-status can read the result.
+    die "command timed out after $timeout seconds\n" if $status->{'timed-out'};
 };
 
 my $read_exec_result = sub {
@@ -3403,7 +3449,7 @@ my $read_exec_result = sub {
     if (!defined($status->{error})) {
         my $stdout = PVE::Tools::file_get_contents("$directory/stdout", $GUEST_EXEC_OUTPUT_LIMIT);
         my $stderr = PVE::Tools::file_get_contents("$directory/stderr", $GUEST_EXEC_OUTPUT_LIMIT);
-        $result->{exitcode} = $status->{exitcode};
+        $result->{exitcode} = 0 + $status->{exitcode};
         $result->{'out-data'} = encode_base64($stdout, '');
         $result->{'err-data'} = encode_base64($stderr, '');
         for my $flag ('out-truncated', 'err-truncated', 'timed-out') {
@@ -3500,7 +3546,7 @@ __PACKAGE__->register_method({
             },
         );
 
-        return { pid => $exec_id };
+        return { pid => 0 + $exec_id };
     },
 });
 
