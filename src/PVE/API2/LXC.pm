@@ -3115,11 +3115,34 @@ my $decode_guest_base64 = sub {
     return decode_base64($value);
 };
 
+# Returns the validated path without the taint flag.
 my $check_guest_file_path = sub {
     my ($file) = @_;
 
-    die "parameter 'file' must be an absolute path\n" if $file !~ m!\A/!;
-    die "parameter 'file' contains a NUL byte\n" if $file =~ m/\0/;
+    die "parameter 'file' must be an absolute path\n" if $file !~ m!\A(/[^\0]*)\z!s;
+    return $1;
+};
+
+# Perl in taint mode rejects a tainted value in mkdir, chmod, unlink, and the arguments of
+# exec. This returns the number from a strict match without the taint flag.
+my $untaint_decimal = sub {
+    my ($name, $value) = @_;
+
+    die "parameter '$name' is not a decimal number\n" if !defined($value) || $value !~ m/\A(\d+)\z/;
+    return $1;
+};
+
+# The API has validated the command and its arguments, and lxc-attach receives each one as a
+# single argument.
+my $untaint_command = sub {
+    my ($command) = @_;
+
+    my @untainted;
+    for my $argument (@$command) {
+        die "a command argument contains a NUL byte\n" if $argument !~ m/\A([^\0]*)\z/s;
+        push @untainted, $1;
+    }
+    return \@untainted;
 };
 
 my $assert_container_running = sub {
@@ -3149,6 +3172,9 @@ my $terminate_attach_process = sub {
 my $run_in_container = sub {
     my ($vmid, $command, $input, $timeout, $output_limit) = @_;
 
+    $vmid = $untaint_decimal->('vmid', $vmid);
+    $timeout = $untaint_decimal->('timeout', $timeout);
+    $command = $untaint_command->($command);
     $assert_container_running->($vmid);
 
     # A command that stops reading its standard input must not terminate pvedaemon with SIGPIPE.
@@ -3261,7 +3287,9 @@ my $run_in_container = sub {
 my $exec_directory = sub {
     my ($vmid, $exec_id) = @_;
 
-    return "$GUEST_EXEC_RESULT_ROOT/$vmid/$exec_id";
+    my $vmid_number = $untaint_decimal->('vmid', $vmid);
+    my $exec_number = $untaint_decimal->('pid', $exec_id);
+    return "$GUEST_EXEC_RESULT_ROOT/$vmid_number/$exec_number";
 };
 
 # Creates the result directory /run/pve/lxc-exec/<vmid>/<id> with mode 0700 and returns the id.
@@ -3270,7 +3298,8 @@ my $exec_directory = sub {
 my $create_exec_directory = sub {
     my ($vmid) = @_;
 
-    my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$vmid";
+    my $vmid_number = $untaint_decimal->('vmid', $vmid);
+    my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$vmid_number";
     for (1 .. $GUEST_EXEC_ID_ATTEMPTS) {
         # The cleanup can remove an empty vmid directory between attempts. Each attempt creates
         # the directory again.
@@ -3284,10 +3313,11 @@ my $create_exec_directory = sub {
         die "unable to read /dev/urandom\n"
             if !defined($read_count) || $read_count != $GUEST_EXEC_ID_BYTES;
 
-        my $exec_id = unpack('Q>', "\0\0" . $random_bytes);
+        # The bytes from /dev/urandom are tainted.
+        my $exec_id = $untaint_decimal->('pid', unpack('Q>', "\0\0" . $random_bytes));
         next if $exec_id < 1;
 
-        my $directory = $exec_directory->($vmid, $exec_id);
+        my $directory = $exec_directory->($vmid_number, $exec_id);
         if (mkdir($directory, 0700)) {
             chmod(0700, $directory);
             return $exec_id;
@@ -3445,12 +3475,14 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $vmid = $param->{vmid};
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
         my $input;
         if (defined($param->{'input-data'})) {
             $input = $decode_guest_base64->('input-data', $param->{'input-data'});
         }
-        my $timeout = $param->{timeout} // $GUEST_EXEC_TIMEOUT_DEFAULT;
+        my $timeout =
+            $untaint_decimal->('timeout', $param->{timeout} // $GUEST_EXEC_TIMEOUT_DEFAULT);
+        my $command = $untaint_command->($param->{command});
 
         $assert_container_running->($vmid);
         $remove_expired_exec_results->();
@@ -3458,7 +3490,6 @@ __PACKAGE__->register_method({
 
         my $rpcenv = PVE::RPCEnvironment::get();
         my $authuser = $rpcenv->get_user();
-        my $command = $param->{command};
 
         $rpcenv->fork_worker(
             'lxcexec',
@@ -3547,7 +3578,10 @@ __PACKAGE__->register_method({
 
         $remove_expired_exec_results->();
 
-        return $read_exec_result->($param->{vmid}, $param->{pid});
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $exec_id = $untaint_decimal->('pid', $param->{pid});
+
+        return $read_exec_result->($vmid, $exec_id);
     },
 });
 
@@ -3585,9 +3619,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $vmid = $param->{vmid};
-        my $file = $param->{file};
-        $check_guest_file_path->($file);
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $file = $check_guest_file_path->($param->{file});
         my $content = $decode_guest_base64->('content', $param->{content});
 
         my ($exitcode, $captured, undef, $timed_out) = $run_in_container->(
@@ -3649,9 +3682,8 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $vmid = $param->{vmid};
-        my $file = $param->{file};
-        $check_guest_file_path->($file);
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $file = $check_guest_file_path->($param->{file});
 
         # One byte beyond the limit shows that the file is larger.
         my $read_size = $GUEST_FILE_READ_LIMIT + 1;
