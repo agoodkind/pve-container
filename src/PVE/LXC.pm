@@ -2593,7 +2593,8 @@ sub bpf_delegate_mount {
             my $reply = "fd " . fileno($fs_context) . "\n";
             syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
 
-            # The child must stay alive while the parent uses the filesystem context.
+            # The child must stay alive until the parent duplicates the filesystem context
+            # descriptor.
             my $unused = <$release_reader>;
             $exit_code = 0;
         };
