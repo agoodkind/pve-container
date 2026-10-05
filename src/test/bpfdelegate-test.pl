@@ -5,6 +5,7 @@ use warnings;
 
 use lib qw(..);
 
+use PVE::API2::LXC;
 use PVE::API2::LXC::Config;
 use PVE::LXC;
 use PVE::LXC::Config;
@@ -137,6 +138,59 @@ for my $user ('bob@pve', 'carol@pve') {
 my $dave_allowed = $rpcenv->check_vm_perm('dave@pve', $vmid, undef, $api_privileges, 1, 1);
 die "the API level check admitted dave\@pve\n" if $dave_allowed;
 print "API level check: " . scalar(@$api_privileges) . " privileges\n";
+
+my $guest_methods = {
+    exec => { path => '{vmid}/exec', method => 'POST', privilege => 'VM.Guest.Exec' },
+    file_write => {
+        path => '{vmid}/file-write',
+        method => 'POST',
+        privilege => 'VM.Guest.FileWrite',
+    },
+    file_read => {
+        path => '{vmid}/file-read',
+        method => 'GET',
+        privilege => 'VM.Guest.FileRead',
+    },
+};
+
+# Each token role has one guest privilege. The owning user has all three.
+my $guest_tokens = {
+    'erin@pve!exec' => 'exec',
+    'erin@pve!read' => 'file_read',
+    'erin@pve!write' => 'file_write',
+};
+
+for my $name (sort keys %$guest_methods) {
+    my $expected = $guest_methods->{$name};
+    my $info = PVE::API2::LXC->map_method_by_name($name);
+    die "method $name is not registered\n" if !$info;
+    die "method $name has path $info->{path}\n" if $info->{path} ne $expected->{path};
+    die "method $name has HTTP method $info->{method}\n"
+        if $info->{method} ne $expected->{method};
+    die "method $name is not protected\n" if !$info->{protected};
+    die "method $name has proxyto $info->{proxyto}\n" if ($info->{proxyto} // '') ne 'node';
+
+    my $check = $info->{permissions}->{check};
+    die "method $name has an unexpected permission check\n"
+        if $check->[1] ne '/vms/{vmid}' || join(',', @{ $check->[2] }) ne $expected->{privilege};
+
+    for my $token (sort keys %$guest_tokens) {
+        my $allowed = $rpcenv->check_vm_perm($token, $vmid, undef, $check->[2], 0, 1);
+        my $should_pass = $guest_tokens->{$token} eq $name;
+        die "token $token was rejected for $name\n" if $should_pass && !$allowed;
+        die "token $token passed for $name\n" if !$should_pass && $allowed;
+        print "GUEST PERM:$name:$token:" . ($allowed ? 'allowed' : 'denied') . "\n";
+    }
+
+    for my $user ('erin@pve', 'root@pam') {
+        die "user $user was rejected for $name\n"
+            if !$rpcenv->check_vm_perm($user, $vmid, undef, $check->[2], 0, 1);
+    }
+    for my $user ('alice@pve', 'dave@pve') {
+        die "user $user passed for $name\n"
+            if $rpcenv->check_vm_perm($user, $vmid, undef, $check->[2], 0, 1);
+    }
+}
 
 print "all tests passed\n";
 

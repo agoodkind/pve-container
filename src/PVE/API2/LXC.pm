@@ -4,8 +4,14 @@ use strict;
 use warnings;
 
 use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
+use IO::Select;
 use IO::Socket::UNIX;
+use IPC::Open3;
+use MIME::Base64 qw(decode_base64 encode_base64);
+use POSIX qw(WNOHANG);
 use Socket qw(SOCK_STREAM);
+use Symbol qw(gensym);
+use Time::HiRes qw();
 use JSON;
 
 use PVE::AccessControl;
@@ -711,6 +717,9 @@ __PACKAGE__->register_method({
             { subdir => 'snapshot' },
             { subdir => 'resize' },
             { subdir => 'interfaces' },
+            { subdir => 'exec' },
+            { subdir => 'file-read' },
+            { subdir => 'file-write' },
         ];
 
         return $res;
@@ -3072,6 +3081,388 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         return PVE::LXC::get_interfaces($param->{vmid});
+    },
+});
+
+# pve-http-server rejects a request body above 512 KiB ($limit_max_post in
+# PVE/APIServer/AnyEvent.pm). A form-encoded body expands each of '+', '/', and '=' to three
+# bytes. The worst case body of a 128 KiB base64 value is 384 KiB.
+my $GUEST_BASE64_MAX_LENGTH = 128 * 1024;
+my $GUEST_BASE64_REGEX = qr{(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?};
+my $GUEST_EXEC_TIMEOUT_DEFAULT = 120;
+my $GUEST_EXEC_TIMEOUT_MAX = 3600;
+my $GUEST_EXEC_OUTPUT_LIMIT = 1024 * 1024;
+my $GUEST_FILE_READ_LIMIT = 4 * 1024 * 1024;
+my $GUEST_FILE_TIMEOUT = 60;
+my $GUEST_FILE_PATH_MAX_LENGTH = 4096;
+my $GUEST_KILL_GRACE_SECONDS = 5;
+my $GUEST_POLL_MICROSECONDS = 50_000;
+my $GUEST_IO_CHUNK_SIZE = 64 * 1024;
+
+my $decode_guest_base64 = sub {
+    my ($name, $value) = @_;
+
+    die "parameter '$name' is not valid base64\n" if $value !~ m/\A$GUEST_BASE64_REGEX\z/;
+    return decode_base64($value);
+};
+
+my $check_guest_file_path = sub {
+    my ($file) = @_;
+
+    die "parameter 'file' must be an absolute path\n" if $file !~ m!\A/!;
+    die "parameter 'file' contains a NUL byte\n" if $file =~ m/\0/;
+};
+
+my $terminate_attach_process = sub {
+    my ($pid) = @_;
+
+    kill('TERM', $pid);
+    my $grace_deadline = Time::HiRes::time() + $GUEST_KILL_GRACE_SECONDS;
+    while (Time::HiRes::time() < $grace_deadline) {
+        return if waitpid($pid, WNOHANG) != 0;
+        Time::HiRes::usleep($GUEST_POLL_MICROSECONDS);
+    }
+    kill('KILL', $pid);
+    waitpid($pid, 0);
+};
+
+# Starts the command with lxc-attach as root, the process that pct exec starts. Output is
+# collected byte for byte because the line based run_command alters carriage returns.
+# Returns the exit code, the captured output per stream, and the truncation flag per stream.
+my $run_in_container = sub {
+    my ($vmid, $command, $input, $timeout, $output_limit) = @_;
+
+    PVE::LXC::Config->load_config($vmid); # test if container exists on this node
+    die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
+
+    # A command that stops reading its standard input must not terminate pvedaemon with SIGPIPE.
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $attach_command = ['lxc-attach', '-n', $vmid, '--clear-env', '--', @$command];
+
+    my ($stdin_handle, $stdout_handle);
+    my $stderr_handle = gensym();
+    my $pid = open3($stdin_handle, $stdout_handle, $stderr_handle, @$attach_command);
+
+    my $read_select = IO::Select->new($stdout_handle, $stderr_handle);
+    my $write_select = IO::Select->new();
+    my $pending_input = $input // '';
+    if (length($pending_input)) {
+        $stdin_handle->blocking(0);
+        $write_select->add($stdin_handle);
+    } else {
+        close($stdin_handle);
+    }
+
+    my $captured = { stdout => '', stderr => '' };
+    my $truncated = { stdout => 0, stderr => 0 };
+    my $deadline = Time::HiRes::time() + $timeout;
+    my $timed_out = 0;
+
+    while ($read_select->count() || $write_select->count()) {
+        my $remaining = $deadline - Time::HiRes::time();
+        if ($remaining <= 0) {
+            $timed_out = 1;
+            last;
+        }
+
+        my ($readable, $writable) =
+            IO::Select->select($read_select, $write_select, undef, $remaining);
+        next if !$readable;
+
+        for my $handle (@$writable) {
+            my $written = syswrite($handle, $pending_input, $GUEST_IO_CHUNK_SIZE);
+            if (defined($written)) {
+                substr($pending_input, 0, $written, '');
+            } elsif ($!{EAGAIN} || $!{EINTR}) {
+                next;
+            } else {
+                $pending_input = '';
+            }
+            if (!length($pending_input)) {
+                $write_select->remove($handle);
+                close($handle);
+            }
+        }
+
+        for my $handle (@$readable) {
+            my $stream = 'stderr';
+            if (fileno($handle) == fileno($stdout_handle)) {
+                $stream = 'stdout';
+            }
+
+            my $count = sysread($handle, my $buffer, $GUEST_IO_CHUNK_SIZE);
+            if (!defined($count)) {
+                next if $!{EAGAIN} || $!{EINTR};
+                $count = 0;
+            }
+            if ($count == 0) {
+                $read_select->remove($handle);
+                close($handle);
+                next;
+            }
+
+            my $space = $output_limit - length($captured->{$stream});
+            if ($count > $space) {
+                $truncated->{$stream} = 1;
+                $count = $space;
+            }
+            $captured->{$stream} .= substr($buffer, 0, $count);
+        }
+    }
+
+    # The command can close its output streams and keep running.
+    my $child_status;
+    while (!$timed_out) {
+        my $reaped = waitpid($pid, WNOHANG);
+        if ($reaped == $pid) {
+            $child_status = $?;
+            last;
+        }
+        die "waiting for the command in container '$vmid' failed: $!\n" if $reaped < 0;
+
+        $timed_out = 1 if Time::HiRes::time() >= $deadline;
+        Time::HiRes::usleep($GUEST_POLL_MICROSECONDS);
+    }
+
+    if ($timed_out) {
+        for my $handle ($read_select->handles(), $write_select->handles()) {
+            close($handle);
+        }
+        $terminate_attach_process->($pid);
+        die "command in container '$vmid' timed out after $timeout seconds\n";
+    }
+
+    my $exitcode = $child_status >> 8;
+    if (my $signal = $child_status & 127) {
+        $exitcode = 128 + $signal;
+    }
+
+    return ($exitcode, $captured, $truncated);
+};
+
+__PACKAGE__->register_method({
+    name => 'exec',
+    path => '{vmid}/exec',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
+    },
+    description => 'Run a command as root in a running container and wait for it to exit.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            command => {
+                type => 'array',
+                description => 'The command as a list of program and arguments.',
+                minItems => 1,
+                items => {
+                    type => 'string',
+                    description => 'One part of the program and arguments.',
+                },
+            },
+            'input-data' => {
+                type => 'string',
+                maxLength => $GUEST_BASE64_MAX_LENGTH,
+                description => 'Base64 encoded data for the standard input of the command.',
+                optional => 1,
+            },
+            timeout => {
+                type => 'integer',
+                minimum => 1,
+                maximum => $GUEST_EXEC_TIMEOUT_MAX,
+                default => $GUEST_EXEC_TIMEOUT_DEFAULT,
+                description => 'Seconds to wait for the command. The command is stopped after'
+                    . ' this time.',
+                optional => 1,
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            exitcode => {
+                type => 'integer',
+                description => 'The exit code of the command, or 128 plus the signal number'
+                    . ' when a signal ended it.',
+            },
+            'out-data' => {
+                type => 'string',
+                description => 'Base64 encoded standard output of the command.',
+            },
+            'err-data' => {
+                type => 'string',
+                description => 'Base64 encoded standard error of the command.',
+            },
+            'out-truncated' => {
+                type => 'boolean',
+                optional => 1,
+                description => "Set when the standard output exceeded $GUEST_EXEC_OUTPUT_LIMIT"
+                    . ' bytes.',
+            },
+            'err-truncated' => {
+                type => 'boolean',
+                optional => 1,
+                description => "Set when the standard error exceeded $GUEST_EXEC_OUTPUT_LIMIT"
+                    . ' bytes.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $input;
+        if (defined($param->{'input-data'})) {
+            $input = $decode_guest_base64->('input-data', $param->{'input-data'});
+        }
+        my $timeout = $param->{timeout} // $GUEST_EXEC_TIMEOUT_DEFAULT;
+
+        my ($exitcode, $captured, $truncated) = $run_in_container->(
+            $param->{vmid}, $param->{command}, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT,
+        );
+
+        my $result = {
+            exitcode => $exitcode,
+            'out-data' => encode_base64($captured->{stdout}, ''),
+            'err-data' => encode_base64($captured->{stderr}, ''),
+        };
+        $result->{'out-truncated'} = 1 if $truncated->{stdout};
+        $result->{'err-truncated'} = 1 if $truncated->{stderr};
+
+        return $result;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'file_write',
+    path => '{vmid}/file-write',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.FileWrite']],
+    },
+    description => 'Write a file as root in a running container. An existing file is replaced.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            file => {
+                type => 'string',
+                maxLength => $GUEST_FILE_PATH_MAX_LENGTH,
+                description => 'The absolute path of the file in the container.',
+            },
+            content => {
+                type => 'string',
+                maxLength => $GUEST_BASE64_MAX_LENGTH,
+                description => 'The base64 encoded content of the file.',
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $param->{vmid};
+        my $file = $param->{file};
+        $check_guest_file_path->($file);
+        my $content = $decode_guest_base64->('content', $param->{content});
+
+        my ($exitcode, $captured) = $run_in_container->(
+            $vmid, ['tee', '--', $file], $content, $GUEST_FILE_TIMEOUT, $GUEST_IO_CHUNK_SIZE,
+        );
+
+        if ($exitcode != 0) {
+            my $error_message = $captured->{stderr};
+            chomp($error_message);
+            die "cannot write '$file' in container '$vmid': $error_message\n";
+        }
+
+        return;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'file_read',
+    path => '{vmid}/file-read',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.FileRead']],
+    },
+    description =>
+        "Read a file as root in a running container. The read stops at $GUEST_FILE_READ_LIMIT"
+        . ' bytes.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            file => {
+                type => 'string',
+                maxLength => $GUEST_FILE_PATH_MAX_LENGTH,
+                description => 'The absolute path of the file in the container.',
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            content => {
+                type => 'string',
+                description => 'The base64 encoded content of the file.',
+            },
+            truncated => {
+                type => 'boolean',
+                optional => 1,
+                description => 'Set when the file is larger than the read limit.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $param->{vmid};
+        my $file = $param->{file};
+        $check_guest_file_path->($file);
+
+        # One byte beyond the limit shows that the file is larger.
+        my $read_size = $GUEST_FILE_READ_LIMIT + 1;
+        my ($exitcode, $captured) = $run_in_container->(
+            $vmid, ['head', '-c', $read_size, '--', $file], undef, $GUEST_FILE_TIMEOUT,
+            $read_size,
+        );
+
+        if ($exitcode != 0) {
+            my $error_message = $captured->{stderr};
+            chomp($error_message);
+            die "cannot read '$file' in container '$vmid': $error_message\n";
+        }
+
+        my $content = $captured->{stdout};
+        my $result = {};
+        if (length($content) > $GUEST_FILE_READ_LIMIT) {
+            $content = substr($content, 0, $GUEST_FILE_READ_LIMIT);
+            $result->{truncated} = 1;
+        }
+        $result->{content} = encode_base64($content, '');
+
+        return $result;
     },
 });
 
