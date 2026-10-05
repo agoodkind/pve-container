@@ -3,7 +3,8 @@ package PVE::API2::LXC;
 use strict;
 use warnings;
 
-use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
+use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC O_RDONLY);
+use File::Path qw(make_path remove_tree);
 use IO::Select;
 use IO::Socket::UNIX;
 use IPC::Open3;
@@ -718,6 +719,7 @@ __PACKAGE__->register_method({
             { subdir => 'resize' },
             { subdir => 'interfaces' },
             { subdir => 'exec' },
+            { subdir => 'exec-status' },
             { subdir => 'file-read' },
             { subdir => 'file-write' },
         ];
@@ -3098,6 +3100,13 @@ my $GUEST_FILE_PATH_MAX_LENGTH = 4096;
 my $GUEST_KILL_GRACE_SECONDS = 5;
 my $GUEST_POLL_MICROSECONDS = 50_000;
 my $GUEST_IO_CHUNK_SIZE = 64 * 1024;
+my $GUEST_EXEC_RESULT_ROOT = '/run/pve/lxc-exec';
+my $GUEST_EXEC_RESULT_TTL = 3600;
+# A result directory without a status file is removed after the longest timeout plus the TTL.
+my $GUEST_EXEC_ORPHAN_TTL = $GUEST_EXEC_TIMEOUT_MAX + $GUEST_EXEC_RESULT_TTL;
+my $GUEST_EXEC_ID_BYTES = 6;
+my $GUEST_EXEC_ID_ATTEMPTS = 10;
+my $GUEST_EXEC_TIMEOUT_EXITCODE = 124;
 
 my $decode_guest_base64 = sub {
     my ($name, $value) = @_;
@@ -3111,6 +3120,13 @@ my $check_guest_file_path = sub {
 
     die "parameter 'file' must be an absolute path\n" if $file !~ m!\A/!;
     die "parameter 'file' contains a NUL byte\n" if $file =~ m/\0/;
+};
+
+my $assert_container_running = sub {
+    my ($vmid) = @_;
+
+    PVE::LXC::Config->load_config($vmid); # test if container exists on this node
+    die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
 };
 
 my $terminate_attach_process = sub {
@@ -3128,12 +3144,12 @@ my $terminate_attach_process = sub {
 
 # Starts the command with lxc-attach as root, the process that pct exec starts. Output is
 # collected byte for byte because the line based run_command alters carriage returns.
-# Returns the exit code, the captured output per stream, and the truncation flag per stream.
+# Returns the exit code, the captured output per stream, the truncation flag per stream, and a
+# timeout flag. A command that exceeds the timeout gets the exit code 124.
 my $run_in_container = sub {
     my ($vmid, $command, $input, $timeout, $output_limit) = @_;
 
-    PVE::LXC::Config->load_config($vmid); # test if container exists on this node
-    die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
+    $assert_container_running->($vmid);
 
     # A command that stops reading its standard input must not terminate pvedaemon with SIGPIPE.
     local $SIG{PIPE} = 'IGNORE';
@@ -3144,6 +3160,7 @@ my $run_in_container = sub {
     my $stderr_handle = gensym();
     my $pid = open3($stdin_handle, $stdout_handle, $stderr_handle, @$attach_command);
 
+    my $stdout_fileno = fileno($stdout_handle);
     my $read_select = IO::Select->new($stdout_handle, $stderr_handle);
     my $write_select = IO::Select->new();
     my $pending_input = $input // '';
@@ -3187,7 +3204,7 @@ my $run_in_container = sub {
 
         for my $handle (@$readable) {
             my $stream = 'stderr';
-            if (fileno($handle) == fileno($stdout_handle)) {
+            if (fileno($handle) == $stdout_fileno) {
                 $stream = 'stdout';
             }
 
@@ -3230,7 +3247,7 @@ my $run_in_container = sub {
             close($handle);
         }
         $terminate_attach_process->($pid);
-        die "command in container '$vmid' timed out after $timeout seconds\n";
+        return ($GUEST_EXEC_TIMEOUT_EXITCODE, $captured, $truncated, 1);
     }
 
     my $exitcode = $child_status >> 8;
@@ -3238,7 +3255,137 @@ my $run_in_container = sub {
         $exitcode = 128 + $signal;
     }
 
-    return ($exitcode, $captured, $truncated);
+    return ($exitcode, $captured, $truncated, 0);
+};
+
+my $exec_directory = sub {
+    my ($vmid, $exec_id) = @_;
+
+    return "$GUEST_EXEC_RESULT_ROOT/$vmid/$exec_id";
+};
+
+# Creates the result directory /run/pve/lxc-exec/<vmid>/<id> with mode 0700 and returns the id.
+# The id is a random 48 bit number because a process ID can repeat before a caller reads the
+# result.
+my $create_exec_directory = sub {
+    my ($vmid) = @_;
+
+    my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$vmid";
+    for (1 .. $GUEST_EXEC_ID_ATTEMPTS) {
+        # The cleanup can remove an empty vmid directory between attempts. Each attempt creates
+        # the directory again.
+        make_path($vmid_directory, { mode => 0700 });
+        chmod(0700, $GUEST_EXEC_RESULT_ROOT, $vmid_directory);
+
+        sysopen(my $random_handle, '/dev/urandom', O_RDONLY)
+            or die "unable to open /dev/urandom: $!\n";
+        my $read_count = sysread($random_handle, my $random_bytes, $GUEST_EXEC_ID_BYTES);
+        close($random_handle);
+        die "unable to read /dev/urandom\n"
+            if !defined($read_count) || $read_count != $GUEST_EXEC_ID_BYTES;
+
+        my $exec_id = unpack('Q>', "\0\0" . $random_bytes);
+        next if $exec_id < 1;
+
+        my $directory = $exec_directory->($vmid, $exec_id);
+        if (mkdir($directory, 0700)) {
+            chmod(0700, $directory);
+            return $exec_id;
+        }
+        die "unable to create '$directory': $!\n" if !$!{EEXIST} && !$!{ENOENT};
+    }
+
+    die "unable to allocate an identifier for the command in container '$vmid'\n";
+};
+
+# Removes results that no caller read within the TTL. A directory without a status file belongs
+# to a command that is still running or to a worker that ended early.
+my $remove_expired_exec_results = sub {
+    my $root_handle;
+    return if !opendir($root_handle, $GUEST_EXEC_RESULT_ROOT);
+
+    my $now = time();
+    for my $vmid_name (readdir($root_handle)) {
+        next if $vmid_name !~ m/\A(\d+)\z/;
+        my $vmid_directory = "$GUEST_EXEC_RESULT_ROOT/$1";
+
+        my $vmid_handle;
+        next if !opendir($vmid_handle, $vmid_directory);
+        for my $id_name (readdir($vmid_handle)) {
+            next if $id_name !~ m/\A(\d+)\z/;
+            my $directory = "$vmid_directory/$1";
+
+            my $reference_time = (stat("$directory/status"))[9];
+            my $time_to_live = $GUEST_EXEC_RESULT_TTL;
+            if (!defined($reference_time)) {
+                $reference_time = (stat($directory))[9];
+                $time_to_live = $GUEST_EXEC_ORPHAN_TTL;
+            }
+            next if !defined($reference_time);
+
+            if ($now - $reference_time > $time_to_live) {
+                remove_tree($directory);
+            }
+        }
+        closedir($vmid_handle);
+        rmdir($vmid_directory); # fails while the directory contains a result
+    }
+    closedir($root_handle);
+};
+
+# Runs in the task worker that fork_worker detaches from pvedaemon. The worker writes the output
+# files first and the status file last. A status file marks a complete result.
+my $run_exec_worker = sub {
+    my ($vmid, $exec_id, $command, $input, $timeout) = @_;
+
+    my $directory = $exec_directory->($vmid, $exec_id);
+    my $status = {};
+    eval {
+        my ($exitcode, $captured, $truncated, $timed_out) = $run_in_container->(
+            $vmid, $command, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT,
+        );
+
+        PVE::Tools::file_set_contents("$directory/stdout", $captured->{stdout}, 0600);
+        PVE::Tools::file_set_contents("$directory/stderr", $captured->{stderr}, 0600);
+
+        $status->{exitcode} = $exitcode;
+        $status->{'out-truncated'} = 1 if $truncated->{stdout};
+        $status->{'err-truncated'} = 1 if $truncated->{stderr};
+        $status->{'timed-out'} = 1 if $timed_out;
+    };
+    if (my $error = $@) {
+        chomp($error);
+        $status = { error => $error };
+    }
+
+    PVE::Tools::file_set_contents("$directory/status", encode_json($status), 0600);
+};
+
+my $read_exec_result = sub {
+    my ($vmid, $exec_id) = @_;
+
+    my $directory = $exec_directory->($vmid, $exec_id);
+    die "no command with pid $exec_id found for container '$vmid'\n" if !-d $directory;
+    return { exited => 0 } if !-e "$directory/status";
+
+    my $status = decode_json(PVE::Tools::file_get_contents("$directory/status"));
+    my $result = { exited => 1 };
+    if (!defined($status->{error})) {
+        my $stdout = PVE::Tools::file_get_contents("$directory/stdout", $GUEST_EXEC_OUTPUT_LIMIT);
+        my $stderr = PVE::Tools::file_get_contents("$directory/stderr", $GUEST_EXEC_OUTPUT_LIMIT);
+        $result->{exitcode} = $status->{exitcode};
+        $result->{'out-data'} = encode_base64($stdout, '');
+        $result->{'err-data'} = encode_base64($stderr, '');
+        for my $flag ('out-truncated', 'err-truncated', 'timed-out') {
+            $result->{$flag} = 1 if $status->{$flag};
+        }
+    }
+    remove_tree($directory);
+
+    die "command $exec_id in container '$vmid' failed: $status->{error}\n"
+        if defined($status->{error});
+
+    return $result;
 };
 
 __PACKAGE__->register_method({
@@ -3250,7 +3397,8 @@ __PACKAGE__->register_method({
     permissions => {
         check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
     },
-    description => 'Run a command as root in a running container and wait for it to exit.',
+    description => 'Start a command as root in a running container and return its identifier at'
+        . ' once. Poll exec-status for the result.',
     parameters => {
         additionalProperties => 0,
         properties => {
@@ -3279,8 +3427,7 @@ __PACKAGE__->register_method({
                 minimum => 1,
                 maximum => $GUEST_EXEC_TIMEOUT_MAX,
                 default => $GUEST_EXEC_TIMEOUT_DEFAULT,
-                description => 'Seconds to wait for the command. The command is stopped after'
-                    . ' this time.',
+                description => 'Seconds until the command is stopped.',
                 optional => 1,
             },
         },
@@ -3288,17 +3435,97 @@ __PACKAGE__->register_method({
     returns => {
         type => 'object',
         properties => {
+            pid => {
+                type => 'integer',
+                description => 'The identifier of the command for exec-status. It is a random'
+                    . ' number, not a process ID.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $param->{vmid};
+        my $input;
+        if (defined($param->{'input-data'})) {
+            $input = $decode_guest_base64->('input-data', $param->{'input-data'});
+        }
+        my $timeout = $param->{timeout} // $GUEST_EXEC_TIMEOUT_DEFAULT;
+
+        $assert_container_running->($vmid);
+        $remove_expired_exec_results->();
+        my $exec_id = $create_exec_directory->($vmid);
+
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $command = $param->{command};
+
+        $rpcenv->fork_worker(
+            'lxcexec',
+            $vmid,
+            $authuser,
+            sub {
+                $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
+            },
+        );
+
+        return { pid => $exec_id };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'exec_status',
+    path => '{vmid}/exec-status',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
+    },
+    description => 'Get the status of a command that exec started. The read of an exited command'
+        . ' deletes its stored result.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            pid => {
+                type => 'integer',
+                minimum => 1,
+                description => 'The identifier that exec returned.',
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            exited => {
+                type => 'boolean',
+                description => 'Set to 1 when the command has exited.',
+            },
             exitcode => {
                 type => 'integer',
+                optional => 1,
                 description => 'The exit code of the command, or 128 plus the signal number'
-                    . ' when a signal ended it.',
+                    . " when a signal ended it. A command that exceeded its timeout has"
+                    . " $GUEST_EXEC_TIMEOUT_EXITCODE.",
+            },
+            'timed-out' => {
+                type => 'boolean',
+                optional => 1,
+                description => 'Set when the command exceeded its timeout and was stopped.',
             },
             'out-data' => {
                 type => 'string',
+                optional => 1,
                 description => 'Base64 encoded standard output of the command.',
             },
             'err-data' => {
                 type => 'string',
+                optional => 1,
                 description => 'Base64 encoded standard error of the command.',
             },
             'out-truncated' => {
@@ -3318,25 +3545,9 @@ __PACKAGE__->register_method({
     code => sub {
         my ($param) = @_;
 
-        my $input;
-        if (defined($param->{'input-data'})) {
-            $input = $decode_guest_base64->('input-data', $param->{'input-data'});
-        }
-        my $timeout = $param->{timeout} // $GUEST_EXEC_TIMEOUT_DEFAULT;
+        $remove_expired_exec_results->();
 
-        my ($exitcode, $captured, $truncated) = $run_in_container->(
-            $param->{vmid}, $param->{command}, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT,
-        );
-
-        my $result = {
-            exitcode => $exitcode,
-            'out-data' => encode_base64($captured->{stdout}, ''),
-            'err-data' => encode_base64($captured->{stderr}, ''),
-        };
-        $result->{'out-truncated'} = 1 if $truncated->{stdout};
-        $result->{'err-truncated'} = 1 if $truncated->{stderr};
-
-        return $result;
+        return $read_exec_result->($param->{vmid}, $param->{pid});
     },
 });
 
@@ -3379,10 +3590,11 @@ __PACKAGE__->register_method({
         $check_guest_file_path->($file);
         my $content = $decode_guest_base64->('content', $param->{content});
 
-        my ($exitcode, $captured) = $run_in_container->(
+        my ($exitcode, $captured, undef, $timed_out) = $run_in_container->(
             $vmid, ['tee', '--', $file], $content, $GUEST_FILE_TIMEOUT, $GUEST_IO_CHUNK_SIZE,
         );
 
+        die "writing '$file' in container '$vmid' timed out\n" if $timed_out;
         if ($exitcode != 0) {
             my $error_message = $captured->{stderr};
             chomp($error_message);
@@ -3443,11 +3655,12 @@ __PACKAGE__->register_method({
 
         # One byte beyond the limit shows that the file is larger.
         my $read_size = $GUEST_FILE_READ_LIMIT + 1;
-        my ($exitcode, $captured) = $run_in_container->(
+        my ($exitcode, $captured, undef, $timed_out) = $run_in_container->(
             $vmid, ['head', '-c', $read_size, '--', $file], undef, $GUEST_FILE_TIMEOUT,
             $read_size,
         );
 
+        die "reading '$file' in container '$vmid' timed out\n" if $timed_out;
         if ($exitcode != 0) {
             my $error_message = $captured->{stderr};
             chomp($error_message);

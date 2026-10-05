@@ -141,6 +141,11 @@ print "API level check: " . scalar(@$api_privileges) . " privileges\n";
 
 my $guest_methods = {
     exec => { path => '{vmid}/exec', method => 'POST', privilege => 'VM.Guest.Exec' },
+    exec_status => {
+        path => '{vmid}/exec-status',
+        method => 'GET',
+        privilege => 'VM.Guest.Exec',
+    },
     file_write => {
         path => '{vmid}/file-write',
         method => 'POST',
@@ -155,9 +160,9 @@ my $guest_methods = {
 
 # Each token role has one guest privilege. The owning user has all three.
 my $guest_tokens = {
-    'erin@pve!exec' => 'exec',
-    'erin@pve!read' => 'file_read',
-    'erin@pve!write' => 'file_write',
+    'erin@pve!exec' => 'VM.Guest.Exec',
+    'erin@pve!read' => 'VM.Guest.FileRead',
+    'erin@pve!write' => 'VM.Guest.FileWrite',
 };
 
 for my $name (sort keys %$guest_methods) {
@@ -176,7 +181,7 @@ for my $name (sort keys %$guest_methods) {
 
     for my $token (sort keys %$guest_tokens) {
         my $allowed = $rpcenv->check_vm_perm($token, $vmid, undef, $check->[2], 0, 1);
-        my $should_pass = $guest_tokens->{$token} eq $name;
+        my $should_pass = $guest_tokens->{$token} eq $expected->{privilege};
         die "token $token was rejected for $name\n" if $should_pass && !$allowed;
         die "token $token passed for $name\n" if !$should_pass && $allowed;
         print "GUEST PERM:$name:$token:" . ($allowed ? 'allowed' : 'denied') . "\n";
@@ -190,6 +195,19 @@ for my $name (sort keys %$guest_methods) {
         die "user $user passed for $name\n"
             if $rpcenv->check_vm_perm($user, $vmid, undef, $check->[2], 0, 1);
     }
+}
+
+my $exec_info = PVE::API2::LXC->map_method_by_name('exec');
+my $status_info = PVE::API2::LXC->map_method_by_name('exec_status');
+die "exec does not return pid\n" if !$exec_info->{returns}->{properties}->{pid};
+die "exec-status has no integer pid parameter\n"
+    if ($status_info->{parameters}->{properties}->{pid}->{type} // '') ne 'integer';
+for my $field (qw(exited exitcode out-data err-data out-truncated err-truncated)) {
+    die "exec-status does not return $field\n"
+        if !$status_info->{returns}->{properties}->{$field};
+}
+for my $field (qw(command input-data timeout)) {
+    die "exec has no parameter $field\n" if !$exec_info->{parameters}->{properties}->{$field};
 }
 
 print "all tests passed\n";
