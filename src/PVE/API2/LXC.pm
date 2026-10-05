@@ -3113,7 +3113,7 @@ my $decode_guest_base64 = sub {
     return decode_base64($value);
 };
 
-# Returns the validated path without the taint flag.
+# $check_guest_file_path returns an absolute path without Perl's taint flag.
 my $check_guest_file_path = sub {
     my ($file) = @_;
 
@@ -3121,8 +3121,8 @@ my $check_guest_file_path = sub {
     return $1;
 };
 
-# Perl in taint mode rejects a tainted value in mkdir, chmod, unlink, and the arguments of
-# exec. This returns the number from a strict match without the taint flag.
+# Perl's taint mode rejects tainted arguments to mkdir, chmod, unlink, and exec.
+# $untaint_decimal returns the validated decimal without the taint flag.
 my $untaint_decimal = sub {
     my ($name, $value) = @_;
 
@@ -3207,10 +3207,9 @@ my $start_attach_process = sub {
     return ($pid, $stdin_write, $stdout_read, $stderr_read);
 };
 
-# Starts the command with lxc-attach as root, the process that pct exec starts. Output is
-# collected byte for byte because the line based run_command alters carriage returns.
-# Returns the exit code, the captured output per stream, the truncation flag per stream, and a
-# timeout flag. A command that exceeds the timeout gets the exit code 124.
+# $run_in_container starts lxc-attach as root and captures raw stdout and stderr.
+# It returns the exit code, captured output, truncation flags, and timeout flag in that order.
+# A command that exceeds the timeout returns exit code 124.
 my $run_in_container = sub {
     my ($vmid, $command, $input, $timeout, $output_limit) = @_;
 
@@ -3333,9 +3332,8 @@ my $exec_directory = sub {
     return "$GUEST_EXEC_RESULT_ROOT/$vmid_number/$exec_number";
 };
 
-# Creates the result directory /run/pve/lxc-exec/<vmid>/<id> with mode 0700 and returns the id.
-# The id is a random 48 bit number because a process ID can repeat before a caller reads the
-# result.
+# Process IDs can repeat before a caller reads the result.
+# $create_exec_directory uses a random 48-bit identifier.
 my $create_exec_directory = sub {
     my ($vmid) = @_;
 
@@ -3369,8 +3367,8 @@ my $create_exec_directory = sub {
     die "unable to allocate an identifier for the command in container '$vmid'\n";
 };
 
-# Removes results that no caller read within the TTL. A directory without a status file belongs
-# to a command that is still running or to a worker that ended early.
+# $remove_expired_exec_results deletes result directories after their retention limit.
+# A directory without a status file represents a running command or an interrupted worker.
 my $remove_expired_exec_results = sub {
     my $root_handle;
     return if !opendir($root_handle, $GUEST_EXEC_RESULT_ROOT);
@@ -3404,8 +3402,8 @@ my $remove_expired_exec_results = sub {
     closedir($root_handle);
 };
 
-# Runs in the task worker that fork_worker detaches from pvedaemon. The worker writes the output
-# files first and the status file last. A status file marks a complete result.
+# $run_exec_worker writes stdout and stderr before the status file.
+# The status file marks a complete result.
 my $run_exec_worker = sub {
     my ($vmid, $exec_id, $command, $input, $timeout) = @_;
 
