@@ -8,7 +8,7 @@ use File::Path qw(make_path remove_tree);
 use IO::Select;
 use IO::Socket::UNIX;
 use MIME::Base64 qw(decode_base64 encode_base64);
-use POSIX qw(WNOHANG);
+use POSIX qw(WNOHANG SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
 use Socket qw(SOCK_STREAM);
 use Time::HiRes qw();
 use JSON;
@@ -3533,16 +3533,33 @@ __PACKAGE__->register_method({
         my $exec_id = $create_exec_directory->($vmid);
 
         my $rpcenv = PVE::RPCEnvironment::get();
-        my $authuser = $rpcenv->get_user();
+        # A request that ends in the same pvedaemon process clears the user of the environment.
+        # The task label is root@pam in that case, the user that runs the method.
+        my $authuser = $rpcenv->get_user(1) // 'root@pam';
 
-        $rpcenv->fork_worker(
-            'lxcexec',
-            $vmid,
-            $authuser,
-            sub {
-                $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
-            },
-        );
+        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
+        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
+        # fork_worker returns, and the signal arrives afterwards.
+        my $sigchld = POSIX::SigSet->new(SIGCHLD);
+        my $previous_signals = POSIX::SigSet->new();
+        sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
+            or die "unable to block SIGCHLD: $!\n";
+        eval {
+            $rpcenv->fork_worker(
+                'lxcexec',
+                $vmid,
+                $authuser,
+                sub {
+                    # The worker inherits the blocked signal, and lxc-attach inherits it
+                    # from the worker.
+                    sigprocmask(SIG_UNBLOCK, $sigchld);
+                    $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
+                },
+            );
+        };
+        my $fork_error = $@;
+        sigprocmask(SIG_SETMASK, $previous_signals);
+        die $fork_error if $fork_error;
 
         return { pid => 0 + $exec_id };
     },
