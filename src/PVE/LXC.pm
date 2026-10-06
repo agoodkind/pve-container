@@ -2640,12 +2640,17 @@ sub bpf_delegate_mount {
         # Verify the mount namespace after the helper calls setns.
         # The helper does not report setns failures.
         my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
+        opendir(my $host_proc_dir, '/proc/self')
+            or die "failed to open the host process directory: $!\n";
         # The lxc-start AppArmor profile permits transitions to lxc-* profiles.
         # The lxc-pve-overlay-mount profile permits the BPF mount operation.
         $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
-        my ($current_dev, $current_ino) = (stat('/proc/self/ns/mnt'))[0, 1];
+        chdir($host_proc_dir) or die "failed to change to the host process directory: $!\n";
+        my ($current_dev, $current_ino) = (stat('ns/mnt'))[0, 1];
+        chdir('/')
+            or die "failed to change directory within the container mount namespace: $!\n";
         die "failed to enter the container mount namespace\n"
-            if $ns_dev != $current_dev || $ns_ino != $current_ino;
+            if !defined($current_ino) || $ns_dev != $current_dev || $ns_ino != $current_ino;
 
         my $target = $BPF_DELEGATE_MOUNT_TARGET;
         PVE::Tools::move_mount(
