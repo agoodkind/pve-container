@@ -1104,9 +1104,11 @@ for (my $i = 0; $i < $MAX_LXC_HOSTNICS; $i++) {
 sub hostnic_lxc_net_index {
     my ($class, $key) = @_;
 
-    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(\d)$/;
+    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(0|[1-9]\d*)$/;
+    my $index = $1;
+    die "'$key' is not a valid hostnic key.\n" if $index >= $MAX_LXC_HOSTNICS;
 
-    return $MAX_LXC_NETWORKS + $1;
+    return $MAX_LXC_NETWORKS + $index;
 }
 
 PVE::JSONSchema::register_format('pve-ct-timezone', \&verify_ct_timezone);
@@ -1755,7 +1757,9 @@ sub get_hostnics {
 
     my $hostnics = {};
     for my $key (sort keys %$conf) {
-        next if $key !~ m/^hostnic\d$/;
+        next if $key !~ m/^hostnic(0|[1-9]\d*)$/;
+        my $index = $1;
+        next if $index >= $MAX_LXC_HOSTNICS;
         $hostnics->{$key} = $class->parse_hostnic($conf->{$key});
     }
 

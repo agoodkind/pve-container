@@ -110,6 +110,9 @@ for my $index (0 .. 9) {
 }
 print "OK:index range\n";
 
+eval { PVE::LXC::Config->hostnic_lxc_net_index('hostnic10') };
+check_equal('index limit', $@, "'hostnic10' is not a valid hostnic key.\n");
+
 check_conflict_rejected(
     'same link',
     { hostnic0 => 'link=nic1v1,name=a', hostnic1 => 'link=nic1v1,name=b' },
