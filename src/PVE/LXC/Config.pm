@@ -586,6 +586,44 @@ my $bpf_delegate_desc = {
     },
 };
 
+my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_.\-]{1,15}';
+
+my $hostnic_desc = {
+    link => {
+        type => 'string',
+        format_description => 'ifname',
+        description => 'Specify the host interface to assign to the container.',
+        pattern => $HOSTNIC_INTERFACE_NAME_PATTERN,
+    },
+    name => {
+        type => 'string',
+        format_description => 'ifname',
+        description => 'Set the interface name inside the container. The default is the host interface name.',
+        pattern => $HOSTNIC_INTERFACE_NAME_PATTERN,
+        optional => 1,
+    },
+    hwaddr => get_standard_option(
+        'mac-addr',
+        {
+            description => 'Set the interface MAC address.',
+            optional => 1,
+        },
+    ),
+    mtu => {
+        type => 'integer',
+        description => 'Set the interface maximum transmission unit.',
+        minimum => 64,
+        maximum => 65535,
+        optional => 1,
+    },
+    up => {
+        type => 'boolean',
+        description => 'Bring the interface up when the container starts. The interface starts administratively down by default.',
+        default => 0,
+        optional => 1,
+    },
+};
+
 my $confdesc = {
     lock => {
         optional => 1,
@@ -1053,6 +1091,24 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
     };
 }
 
+my $MAX_LXC_HOSTNICS = 10;
+for (my $i = 0; $i < $MAX_LXC_HOSTNICS; $i++) {
+    $confdesc->{"hostnic$i"} = {
+        optional => 1,
+        type => 'string',
+        format => $hostnic_desc,
+        description => 'Assign a host interface to the container as an LXC physical device.',
+    };
+}
+
+sub hostnic_lxc_net_index {
+    my ($class, $key) = @_;
+
+    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(\d)$/;
+
+    return $MAX_LXC_NETWORKS + $1;
+}
+
 PVE::JSONSchema::register_format('pve-ct-timezone', \&verify_ct_timezone);
 
 sub verify_ct_timezone {
@@ -1476,6 +1532,9 @@ sub update_pct_config {
         $class->remove_from_pending_delete($conf, $opt);
     }
 
+    $class->check_pending_hostnic_conflicts($conf)
+        if grep { m/^(?:hostnic|net)\d+$/ } keys %$modified;
+
     my $changes = $class->cleanup_pending($conf);
 
     my $errors = {};
@@ -1679,6 +1738,81 @@ sub parse_bpf_delegate {
     my ($class, $data) = @_;
     return {} if !$data;
     return PVE::JSONSchema::parse_property_string($bpf_delegate_desc, $data);
+}
+
+sub parse_hostnic {
+    my ($class, $data) = @_;
+
+    my $res = PVE::JSONSchema::parse_property_string($hostnic_desc, $data);
+    $res->{name} //= $res->{link};
+    $res->{up} //= 0;
+
+    return $res;
+}
+
+sub get_hostnics {
+    my ($class, $conf) = @_;
+
+    my $hostnics = {};
+    for my $key (sort keys %$conf) {
+        next if $key !~ m/^hostnic\d$/;
+        $hostnics->{$key} = $class->parse_hostnic($conf->{$key});
+    }
+
+    return $hostnics;
+}
+
+sub check_hostnic_conflicts {
+    my ($class, $conf) = @_;
+
+    my $net_names = {};
+    for my $key (sort keys %$conf) {
+        next if $key !~ m/^net\d+$/;
+        my $net = PVE::JSONSchema::parse_property_string($netconf_desc, $conf->{$key});
+        $net_names->{ $net->{name} } = $key;
+    }
+
+    my $hostnics = $class->get_hostnics($conf);
+    my $link_owners = {};
+    my $name_owners = {};
+    for my $key (sort keys %$hostnics) {
+        my $link = $hostnics->{$key}->{link};
+        my $name = $hostnics->{$key}->{name};
+
+        die "$key: $link_owners->{$link} already uses host interface '$link'.\n"
+            if defined($link_owners->{$link});
+        $link_owners->{$link} = $key;
+
+        die "$key: $name_owners->{$name} already uses container interface name '$name'.\n"
+            if defined($name_owners->{$name});
+        die "$key: $net_names->{$name} already uses container interface name '$name'.\n"
+            if defined($net_names->{$name});
+        $name_owners->{$name} = $key;
+    }
+
+    return;
+}
+
+sub check_pending_hostnic_conflicts {
+    my ($class, $conf) = @_;
+
+    my $effective_conf = {};
+    for my $key (keys %$conf) {
+        next if $key eq 'pending';
+        $effective_conf->{$key} = $conf->{$key};
+    }
+    for my $key (keys %{ $conf->{pending} }) {
+        next if $key eq 'delete';
+        $effective_conf->{$key} = $conf->{pending}->{$key};
+    }
+    my $pending_delete = $class->parse_pending_delete($conf->{pending}->{delete});
+    for my $key (keys %$pending_delete) {
+        delete $effective_conf->{$key};
+    }
+
+    $class->check_hostnic_conflicts($effective_conf);
+
+    return;
 }
 
 sub option_exists {

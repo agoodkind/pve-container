@@ -718,6 +718,42 @@ sub make_bpf_delegate_hook_config {
     return "lxc.hook.start-host = /usr/bin/perl -e '$program' $vmid @$list_args\n";
 }
 
+sub make_hostnic_config {
+    my ($conf) = @_;
+
+    PVE::LXC::Config->check_hostnic_conflicts($conf);
+
+    my $raw = '';
+    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
+    for my $key (sort keys %$hostnics) {
+        my $hostnic = $hostnics->{$key};
+        my $ind = PVE::LXC::Config->hostnic_lxc_net_index($key);
+        $raw .= "lxc.net.$ind.type = phys\n";
+        $raw .= "lxc.net.$ind.link = $hostnic->{link}\n";
+        $raw .= "lxc.net.$ind.name = $hostnic->{name}\n";
+        $raw .= "lxc.net.$ind.hwaddr = $hostnic->{hwaddr}\n" if defined($hostnic->{hwaddr});
+        $raw .= "lxc.net.$ind.mtu = $hostnic->{mtu}\n" if defined($hostnic->{mtu});
+        $raw .= "lxc.net.$ind.flags = up\n" if $hostnic->{up};
+    }
+
+    return $raw;
+}
+
+sub check_hostnic_links {
+    my ($conf, $net_dir) = @_;
+
+    $net_dir //= '/sys/class/net';
+
+    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
+    for my $key (sort keys %$hostnics) {
+        my $link = $hostnics->{$key}->{link};
+        die "$key: Host interface '$link' does not exist.\n" if !-d "$net_dir/$link";
+        die "$key: Host interface '$link' is a Linux bridge.\n" if -d "$net_dir/$link/bridge";
+    }
+
+    return;
+}
+
 sub update_lxc_config {
     my ($vmid, $conf) = @_;
 
@@ -916,6 +952,8 @@ sub update_lxc_config {
             $raw .= "lxc.net.$ind.flags = up\n";
         }
     }
+
+    $raw .= make_hostnic_config($conf);
 
     if (my $env = $conf->{env}) {
         for my $variable (split(/\0+/, $env)) {
@@ -1850,6 +1888,21 @@ sub check_ct_modify_config_perm {
 
             my $privileges = get_changed_bpf_delegate_privileges($old_delegate, $new_delegate);
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, $privileges) if @$privileges;
+        } elsif ($opt =~ m/^hostnic\d+$/) {
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HostNIC']);
+
+            my $links = {};
+            if (defined($oldconf) && $oldconf->{$opt}) {
+                my $old_hostnic = PVE::LXC::Config->parse_hostnic($oldconf->{$opt});
+                $links->{ $old_hostnic->{link} } = 1;
+            }
+            if (!$delete && defined($newconf->{$opt})) {
+                my $new_hostnic = PVE::LXC::Config->parse_hostnic($newconf->{$opt});
+                $links->{ $new_hostnic->{link} } = 1;
+            }
+            for my $link (sort keys %$links) {
+                $rpcenv->check($authuser, "/hostnic/$link", ['Sys.HostNIC.Use']);
+            }
         } elsif ($opt eq 'hookscript') {
             # For now this is restricted to root@pam
             raise_perm_exc("changing the hookscript is only allowed for root\@pam");
@@ -3415,6 +3468,8 @@ sub vm_start {
         PVE::LXC::Config->write_config($vmid, $conf);
         $conf = PVE::LXC::Config->load_config($vmid); # update/reload
     }
+
+    check_hostnic_links($conf);
 
     update_lxc_config($vmid, $conf);
 

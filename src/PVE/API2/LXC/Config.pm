@@ -108,6 +108,7 @@ my $vm_config_perm_list = [
     'VM.Config.Options',
     'VM.Config.Nesting',
     'VM.Config.Keyctl',
+    'VM.Config.HostNIC',
     @{ PVE::AccessControl::bpf_delegate_privileges() },
 ];
 
