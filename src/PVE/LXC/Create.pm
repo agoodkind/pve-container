@@ -550,6 +550,12 @@ sub sanitize_and_merge_config {
             next;
         }
 
+        if ($key =~ /^hostnic\d+$/ && $restricted) {
+            $rpcenv->warn("Restore skipped $key. Restore $oldconf->{$key} manually as root\@pam.");
+
+            next;
+        }
+
         if ($key eq 'lxc' && $restricted) {
             my $lxc_list = $oldconf->{'lxc'};
 
