@@ -742,7 +742,7 @@ sub make_hostnic_config {
 sub check_hostnic_links {
     my ($conf, $net_dir) = @_;
 
-    $net_dir //= '/sys/class/net';
+    die "check_hostnic_links: net_dir is required\n" if !defined($net_dir);
 
     my $hostnics = PVE::LXC::Config->get_hostnics($conf);
     for my $key (sort keys %$hostnics) {
@@ -3469,7 +3469,7 @@ sub vm_start {
         $conf = PVE::LXC::Config->load_config($vmid); # update/reload
     }
 
-    check_hostnic_links($conf);
+    check_hostnic_links($conf, '/sys/class/net');
 
     update_lxc_config($vmid, $conf);
 
