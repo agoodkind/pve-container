@@ -180,8 +180,11 @@ mkdir "$net_dir/br0/bridge" or die "mkdir br0/bridge: $!\n";
 
 PVE::LXC::check_hostnic_links({ hostnic0 => 'link=plain0' }, $net_dir);
 PVE::LXC::check_hostnic_links({ net0 => 'name=eth0' }, $net_dir);
-PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' });
+PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' }, '/sys/class/net');
 print "OK:existing links\n";
+
+eval { PVE::LXC::check_hostnic_links({ hostnic0 => 'link=lo' }) };
+check_equal('missing net_dir', $@, "check_hostnic_links: net_dir is required\n");
 
 eval { PVE::LXC::check_hostnic_links({ hostnic0 => 'link=missing0' }, $net_dir) };
 die "a missing host interface was accepted\n"
