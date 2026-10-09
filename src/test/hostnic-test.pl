@@ -71,6 +71,9 @@ check_parse_rejected('link=1234567890123456');
 check_parse_rejected('link=nic/1');
 check_parse_rejected('link=nic 1');
 check_parse_rejected('link=');
+check_parse_rejected('link=.');
+check_parse_rejected('link=..');
+check_parse_rejected('link=nic1v1,name=..');
 check_parse_rejected('link=nic1v1,name=1234567890123456');
 check_parse_rejected('link=nic1v1,name=a/b');
 check_parse_rejected('link=nic1v1,hwaddr=zz');
@@ -160,6 +163,15 @@ print "PENDING REJECTED:$@";
 $pending_conf->{pending}->{delete} = 'hostnic0';
 PVE::LXC::Config->check_pending_hostnic_conflicts($pending_conf);
 print "OK:pending delete resolves the conflict\n";
+
+my $direct_conf = { net0 => 'name=eth0,bridge=vmbr0', hostnic0 => 'link=nic1v1' };
+PVE::LXC::Config->check_pending_hostnic_conflicts($direct_conf);
+check_equal('keys without a pending section', join(',', sort keys %$direct_conf), 'hostnic0,net0');
+$direct_conf->{hostnic1} = 'link=nic1v1,name=other';
+eval { PVE::LXC::Config->check_pending_hostnic_conflicts($direct_conf) };
+die "a duplicate link without a pending section was accepted\n"
+    if $@ !~ /hostnic1: hostnic0 already uses host interface 'nic1v1'\./;
+print "DIRECT REJECTED:$@";
 
 my $net_dir = tempdir(CLEANUP => 1);
 mkdir "$net_dir/plain0" or die "mkdir plain0: $!\n";
