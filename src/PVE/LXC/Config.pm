@@ -586,7 +586,7 @@ my $bpf_delegate_desc = {
     },
 };
 
-my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_.\-]{1,15}';
+my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_][a-zA-Z0-9_.\-]{0,14}';
 
 my $hostnic_desc = {
     link => {
@@ -1805,11 +1805,12 @@ sub check_pending_hostnic_conflicts {
         next if $key eq 'pending';
         $effective_conf->{$key} = $conf->{$key};
     }
-    for my $key (keys %{ $conf->{pending} }) {
+    my $pending = $conf->{pending} // {};
+    for my $key (keys %$pending) {
         next if $key eq 'delete';
-        $effective_conf->{$key} = $conf->{pending}->{$key};
+        $effective_conf->{$key} = $pending->{$key};
     }
-    my $pending_delete = $class->parse_pending_delete($conf->{pending}->{delete});
+    my $pending_delete = $class->parse_pending_delete($pending->{delete});
     for my $key (keys %$pending_delete) {
         delete $effective_conf->{$key};
     }
