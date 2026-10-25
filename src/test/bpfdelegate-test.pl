@@ -142,6 +142,7 @@ print "API level check: " . scalar(@$api_privileges) . " privileges\n";
 my $guest_methods = {
     exec => 'VM.Guest.Exec',
     exec_status => 'VM.Guest.Exec',
+    exec_ack => 'VM.Guest.Exec',
     file_write => 'VM.Guest.FileWrite',
     file_read => 'VM.Guest.FileRead',
 };
