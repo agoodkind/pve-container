@@ -67,18 +67,24 @@ my $status = $?;
 open(my $lock, '>>', PVE::SRIOVLock::PATH) or die "Cannot reopen the attachment lock: $!\n";
 ok(flock($lock, LOCK_EX | LOCK_NB), 'Mutation can acquire the lock after startup finishes');
 close($lock);
+my $unit = "pve-container\@$vmid.service";
+my $unit_state = sub {
+    my $state;
+    run_command(['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
+        outfunc => sub { $state = shift });
+    return $state;
+};
 if ($expected eq 'running') {
     is($status, 0, 'The slow startup succeeds') or diag($error);
     ok(eval { PVE::LXC::find_lxc_pid($vmid) }, 'The running container has an init PID');
-    run_command(['systemctl', 'stop', "pve-container\@$vmid.service"]);
 } else {
     is($status, 256, 'The rejected startup fails');
     like($error, qr/startup for container '\Q$vmid\E' failed/, 'The monitor reports the terminal state');
-    my $state;
-    run_command(['systemctl', 'show', "pve-container\@$vmid.service", '-p', 'ActiveState', '--value'],
-        outfunc => sub { $state = shift });
-    like($state, qr/\A(?:failed|inactive)\z/, 'The systemd unit has stopped');
+    like($unit_state->(), qr/\A(?:failed|inactive)\z/, 'The systemd unit has stopped');
     ok(!PVE::LXC::check_running($vmid), 'Teardown finishes before vm_start returns');
 }
+run_command(['systemctl', 'stop', $unit]);
+like($unit_state->(), qr/\A(?:failed|inactive)\z/, 'Cleanup stopped the test unit');
+ok(!PVE::LXC::check_running($vmid), 'Cleanup stopped the test container');
 die $monitor_error if $monitor_error;
 done_testing();
