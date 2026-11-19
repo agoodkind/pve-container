@@ -3489,6 +3489,12 @@ sub vm_start {
     };
     warn "lxc.idmap: $@" if $@;
 
+    my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
+    if (my $err = $@) {
+        die "Cannot monitor startup for container $vmid: $err" if $attachment_lock;
+        warn $err;
+    }
+
     my $skiplock_flag_fn = "/run/lxc/skiplock-$vmid";
 
     if ($skiplock) {
@@ -3501,15 +3507,6 @@ sub vm_start {
     my $vollist = PVE::LXC::Config->get_vm_volumes($conf);
 
     PVE::Storage::activate_volumes($storage_cfg, $vollist);
-
-    my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
-    if (my $err = $@) {
-        if ($attachment_lock) {
-            unlink $skiplock_flag_fn if $skiplock;
-            die "Cannot monitor startup for container $vmid: $err";
-        }
-        warn $err;
-    }
 
     unlink "/run/pve/ct-$vmid.stderr"; # systemd does not truncate log files
 
