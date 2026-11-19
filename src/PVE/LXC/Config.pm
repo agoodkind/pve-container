@@ -6,6 +6,7 @@ use warnings;
 use Fcntl qw(O_RDONLY);
 
 use PVE::AbstractConfig;
+use PVE::AccessControl;
 use PVE::Cluster qw(cfs_register_file);
 use PVE::DataCenterConfig;
 use PVE::GuestHelpers;
@@ -505,6 +506,119 @@ my $features_desc = {
     },
 };
 
+sub verify_bpf_delegate_list {
+    my ($kind, $value, $noerr) = @_;
+
+    my $allowed = {};
+    for my $token (PVE::AccessControl::bpf_delegate_tokens($kind)->@*) {
+        $allowed->{$token} = 1;
+    }
+
+    my $seen = {};
+    for my $token (split(/;/, $value, -1)) {
+        if (!$allowed->{$token}) {
+            return undef if $noerr;
+            die "invalid bpf delegate $kind value '$token'\n";
+        }
+        if ($seen->{$token}++) {
+            return undef if $noerr;
+            die "duplicate bpf delegate $kind value '$token'\n";
+        }
+    }
+
+    return $value;
+}
+
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-cmds',
+    sub { return verify_bpf_delegate_list('cmds', @_) },
+);
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-maps',
+    sub { return verify_bpf_delegate_list('maps', @_) },
+);
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-progs',
+    sub { return verify_bpf_delegate_list('progs', @_) },
+);
+PVE::JSONSchema::register_format(
+    'pve-lxc-bpf-delegate-attachs',
+    sub { return verify_bpf_delegate_list('attachs', @_) },
+);
+
+my $bpf_delegate_desc = {
+    cmds => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-cmds',
+        format_description => 'cmd;cmd;...',
+        description => "The container may execute these BPF commands using a BPF token."
+            . " Use lowercase bpf_cmd constants without the BPF_ prefix.",
+    },
+    maps => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-maps',
+        format_description => 'maptype;maptype;...',
+        description => "The container may create these BPF map types using a BPF token."
+            . " Use lowercase bpf_map_type constants without the BPF_MAP_TYPE_ prefix.",
+    },
+    progs => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-progs',
+        format_description => 'progtype;progtype;...',
+        description => "The container may load these BPF program types using a BPF token."
+            . " Use lowercase bpf_prog_type constants without the BPF_PROG_TYPE_ prefix.",
+    },
+    attachs => {
+        optional => 1,
+        type => 'string',
+        format => 'pve-lxc-bpf-delegate-attachs',
+        format_description => 'attachtype;attachtype;...',
+        description => "The container may use these BPF attach types using a BPF token."
+            . " Use lowercase bpf_attach_type constants without the BPF_ prefix.",
+    },
+};
+
+my $HOSTNIC_INTERFACE_NAME_PATTERN = '[a-zA-Z0-9_][a-zA-Z0-9_.\-]{0,14}';
+
+my $hostnic_desc = {
+    link => {
+        type => 'string',
+        format_description => 'ifname',
+        description => 'Specify the host interface to assign to the container.',
+        pattern => $HOSTNIC_INTERFACE_NAME_PATTERN,
+    },
+    name => {
+        type => 'string',
+        format_description => 'ifname',
+        description => 'Set the interface name inside the container. The default is the host interface name.',
+        pattern => $HOSTNIC_INTERFACE_NAME_PATTERN,
+        optional => 1,
+    },
+    hwaddr => get_standard_option(
+        'mac-addr',
+        {
+            description => 'Set the interface MAC address.',
+            optional => 1,
+        },
+    ),
+    mtu => {
+        type => 'integer',
+        description => 'Set the interface maximum transmission unit.',
+        minimum => 64,
+        maximum => 65535,
+        optional => 1,
+    },
+    up => {
+        type => 'boolean',
+        description => 'Bring the interface up when the container starts. The interface starts administratively down by default.',
+        default => 0,
+        optional => 1,
+    },
+};
+
 my $confdesc = {
     lock => {
         optional => 1,
@@ -688,6 +802,14 @@ my $confdesc = {
         type => 'string',
         format => $features_desc,
         description => "Allow containers access to advanced features.",
+    },
+    bpfdelegate => {
+        optional => 1,
+        type => 'string',
+        format => $bpf_delegate_desc,
+        description => "Configure BPF token delegation for unprivileged containers."
+            . " The start hook mounts bpffs at /sys/fs/bpf. The API requires the corresponding"
+            . " VM.Config.BPFDelegate privilege for each listed name added or removed.",
     },
     env => {
         type => 'string',
@@ -962,6 +1084,26 @@ for (my $i = 0; $i < $MAX_LXC_NETWORKS; $i++) {
         format => $netconf_desc,
         description => "Specifies network interfaces for the container.",
     };
+}
+
+my $MAX_LXC_HOSTNICS = 10;
+for (my $i = 0; $i < $MAX_LXC_HOSTNICS; $i++) {
+    $confdesc->{"hostnic$i"} = {
+        optional => 1,
+        type => 'string',
+        format => $hostnic_desc,
+        description => 'Assign a host interface to the container as an LXC physical device.',
+    };
+}
+
+sub hostnic_lxc_net_index {
+    my ($class, $key) = @_;
+
+    die "'$key' is not a valid hostnic key.\n" if $key !~ m/^hostnic(0|[1-9]\d*)$/;
+    my $index = $1;
+    die "'$key' is not a valid hostnic key.\n" if $index >= $MAX_LXC_HOSTNICS;
+
+    return $MAX_LXC_NETWORKS + $index;
 }
 
 PVE::JSONSchema::register_format('pve-ct-timezone', \&verify_ct_timezone);
@@ -1392,6 +1534,9 @@ sub queue_pct_config_changes {
         $class->remove_from_pending_delete($conf, $opt);
     }
 
+    $class->check_pending_hostnic_conflicts($conf)
+        if grep { m/^(?:hostnic|net)\d+$/ } keys %$modified;
+
     $class->cleanup_pending($conf);
 
     return $modified;
@@ -1598,6 +1743,90 @@ sub parse_features {
     my ($class, $data) = @_;
     return {} if !$data;
     return PVE::JSONSchema::parse_property_string($features_desc, $data);
+}
+
+sub parse_bpf_delegate {
+    my ($class, $data) = @_;
+    return {} if !$data;
+    return PVE::JSONSchema::parse_property_string($bpf_delegate_desc, $data);
+}
+
+sub parse_hostnic {
+    my ($class, $data) = @_;
+
+    my $res = PVE::JSONSchema::parse_property_string($hostnic_desc, $data);
+    $res->{name} //= $res->{link};
+    $res->{up} //= 0;
+
+    return $res;
+}
+
+sub get_hostnics {
+    my ($class, $conf) = @_;
+
+    my $hostnics = {};
+    for my $key (sort keys %$conf) {
+        next if $key !~ m/^hostnic(0|[1-9]\d*)$/;
+        my $index = $1;
+        next if $index >= $MAX_LXC_HOSTNICS;
+        $hostnics->{$key} = $class->parse_hostnic($conf->{$key});
+    }
+
+    return $hostnics;
+}
+
+sub check_hostnic_conflicts {
+    my ($class, $conf) = @_;
+
+    my $net_names = {};
+    for my $key (sort keys %$conf) {
+        next if $key !~ m/^net\d+$/;
+        my $net = PVE::JSONSchema::parse_property_string($netconf_desc, $conf->{$key});
+        $net_names->{ $net->{name} } = $key;
+    }
+
+    my $hostnics = $class->get_hostnics($conf);
+    my $link_owners = {};
+    my $name_owners = {};
+    for my $key (sort keys %$hostnics) {
+        my $link = $hostnics->{$key}->{link};
+        my $name = $hostnics->{$key}->{name};
+
+        die "$key: $link_owners->{$link} already uses host interface '$link'.\n"
+            if defined($link_owners->{$link});
+        $link_owners->{$link} = $key;
+
+        die "$key: $name_owners->{$name} already uses container interface name '$name'.\n"
+            if defined($name_owners->{$name});
+        die "$key: $net_names->{$name} already uses container interface name '$name'.\n"
+            if defined($net_names->{$name});
+        $name_owners->{$name} = $key;
+    }
+
+    return;
+}
+
+sub check_pending_hostnic_conflicts {
+    my ($class, $conf) = @_;
+
+    my $effective_conf = {};
+    for my $key (keys %$conf) {
+        next if $key eq 'pending';
+        $effective_conf->{$key} = $conf->{$key};
+    }
+    my $pending = $conf->{pending} // {};
+    for my $key (keys %$pending) {
+        next if $key eq 'delete';
+        $effective_conf->{$key} = $pending->{$key};
+    }
+    my $pending_delete = $class->parse_pending_delete($pending->{delete});
+    for my $key (keys %$pending_delete) {
+        delete $effective_conf->{$key};
+    }
+
+    $class->check_hostnic_conflicts($effective_conf);
+
+    return;
 }
 
 sub option_exists {

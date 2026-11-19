@@ -670,6 +670,73 @@ sub make_apparmor_config {
     return $raw;
 }
 
+# Generates the lxc.hook.start-host entry, which Proxmox rejects in a raw container config.
+# LXC splits the hook line like a shell and appends the container name, 'lxc', and
+# 'start-host' to the arguments.
+sub make_bpf_delegate_hook_config {
+    my ($conf, $vmid, $unprivileged) = @_;
+
+    return '' if !$conf->{bpfdelegate};
+
+    die "bpfdelegate requires an unprivileged container\n" if !$unprivileged;
+
+    my $delegate = PVE::LXC::Config->parse_bpf_delegate($conf->{bpfdelegate});
+
+    my $list_args = [];
+    for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
+        next if !$delegate->{$kind};
+        my $kernel_list = join(':', split(/;/, $delegate->{$kind}));
+        push @$list_args, "'$kind=$kernel_list'";
+    }
+    return '' if !@$list_args;
+
+    my $program = 'use PVE::LXC; PVE::LXC::bpf_delegate_start_host(@ARGV)';
+    return "lxc.hook.start-host = /usr/bin/perl -e '$program' $vmid @$list_args\n";
+}
+
+sub make_hostnic_config {
+    my ($conf) = @_;
+
+    PVE::LXC::Config->check_hostnic_conflicts($conf);
+
+    my $raw = '';
+    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
+    for my $key (sort keys %$hostnics) {
+        my $hostnic = $hostnics->{$key};
+        my $ind = PVE::LXC::Config->hostnic_lxc_net_index($key);
+        $raw .= "lxc.net.$ind.type = phys\n";
+        $raw .= "lxc.net.$ind.link = $hostnic->{link}\n";
+        $raw .= "lxc.net.$ind.name = $hostnic->{name}\n";
+        $raw .= "lxc.net.$ind.hwaddr = $hostnic->{hwaddr}\n" if defined($hostnic->{hwaddr});
+        $raw .= "lxc.net.$ind.mtu = $hostnic->{mtu}\n" if defined($hostnic->{mtu});
+        $raw .= "lxc.net.$ind.flags = up\n" if $hostnic->{up};
+    }
+
+    return $raw;
+}
+
+sub lock_hostnics_for_start {
+    my ($conf) = @_;
+    return undef if !grep { /\Ahostnic\d+\z/ } keys %$conf;
+    require PVE::SRIOVLock;
+    return PVE::SRIOVLock::lock_attachment();
+}
+
+sub check_hostnic_links {
+    my ($conf, $net_dir) = @_;
+
+    die "check_hostnic_links: net_dir is required\n" if !defined($net_dir);
+
+    my $hostnics = PVE::LXC::Config->get_hostnics($conf);
+    for my $key (sort keys %$hostnics) {
+        my $link = $hostnics->{$key}->{link};
+        die "$key: Host interface '$link' does not exist.\n" if !-d "$net_dir/$link";
+        die "$key: Host interface '$link' is a Linux bridge.\n" if -d "$net_dir/$link/bridge";
+    }
+
+    return;
+}
+
 sub update_lxc_config {
     my ($vmid, $conf) = @_;
 
@@ -730,6 +797,8 @@ sub update_lxc_config {
         $raw .= "lxc.apparmor.raw = mount fstype=fuse,\n";
         $raw .= "lxc.mount.entry = /dev/fuse dev/fuse none bind,create=file 0 0\n";
     }
+
+    $raw .= make_bpf_delegate_hook_config($conf, $vmid, $unprivileged);
 
     if ($unprivileged && !$features->{force_rw_sys}) {
         # unpriv. CT default to sys:rw, but that doesn't always plays well with
@@ -866,6 +935,8 @@ sub update_lxc_config {
             $raw .= "lxc.net.$ind.flags = up\n";
         }
     }
+
+    $raw .= make_hostnic_config($conf);
 
     if (my $env = $conf->{env}) {
         for my $variable (split(/\0+/, $env)) {
@@ -1623,11 +1694,75 @@ sub delete_read_restricted_options {
     return $conf;
 }
 
+# feature flags that non-root users may change with a dedicated privilege
+my $feature_flags_with_privilege = {
+    nesting => 1,
+    keyctl => 1,
+};
+
+# feature flags with a boolean value, where an absent flag equals 0
+my $boolean_feature_flags = {
+    nesting => 1,
+    keyctl => 1,
+    fuse => 1,
+    mknod => 1,
+    force_rw_sys => 1,
+};
+
+sub normalize_feature_flag_value {
+    my ($name, $value) = @_;
+
+    if ($boolean_feature_flags->{$name}) {
+        return $value ? 1 : 0;
+    }
+    return $value // '';
+}
+
+# Returns the names of all feature flags with a different semantic value in the two parsed
+# feature hashes. An absent flag and a flag set to 0 are equal.
+sub get_changed_feature_flags {
+    my ($old_features, $new_features) = @_;
+
+    my $names = {};
+    $names->{$_} = 1 for keys %$old_features, keys %$new_features;
+
+    my $changed = [];
+    for my $name (sort keys %$names) {
+        my $old = normalize_feature_flag_value($name, $old_features->{$name});
+        my $new = normalize_feature_flag_value($name, $new_features->{$name});
+        push @$changed, $name if $old ne $new;
+    }
+    return $changed;
+}
+
+# Returns the VM.Config.BPFDelegate privilege of every name that is in only one of the two
+# parsed bpfdelegate hashes.
+sub get_changed_bpf_delegate_privileges {
+    my ($old_delegate, $new_delegate) = @_;
+
+    my $privileges = [];
+    for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
+        my $old_names = {};
+        for my $name (split(/;/, $old_delegate->{$kind} // '')) {
+            $old_names->{$name} = 1;
+        }
+        my $new_names = {};
+        for my $name (split(/;/, $new_delegate->{$kind} // '')) {
+            $new_names->{$name} = 1;
+        }
+
+        for my $name (@{ PVE::AccessControl::bpf_delegate_tokens($kind) }) {
+            next if !!$old_names->{$name} == !!$new_names->{$name};
+            push @$privileges, PVE::AccessControl::bpf_delegate_privilege($kind, $name);
+        }
+    }
+    return $privileges;
+}
+
 sub check_ct_modify_config_perm {
     my ($rpcenv, $authuser, $vmid, $pool, $oldconf, $newconf, $delete, $unprivileged) = @_;
 
     return 1 if $authuser eq 'root@pam';
-    my $storage_cfg = PVE::Storage::config();
 
     my $check = sub {
         my ($opt, $delete) = @_;
@@ -1644,6 +1779,8 @@ sub check_ct_modify_config_perm {
                 my $sid = $1;
                 $rpcenv->check($authuser, "/storage/$sid", ['Datastore.AllocateSpace']);
             } else {
+                # Read the storage config only here. The read needs the cluster file system.
+                my $storage_cfg = PVE::Storage::config();
                 PVE::Storage::check_volume_access(
                     $rpcenv, $authuser, $storage_cfg, $vmid, $volid, 'rootdir',
                 );
@@ -1659,51 +1796,68 @@ sub check_ct_modify_config_perm {
         } elsif ($opt eq 'nameserver' || $opt eq 'searchdomain' || $opt eq 'hostname') {
             $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Network']);
         } elsif ($opt eq 'features') {
-            raise_perm_exc(
-                "changing feature flags for privileged container is only allowed for root\@pam")
-                if !$unprivileged;
-
-            my $nesting_changed = 0;
-            my $other_changed = 0;
+            my $old_features = {};
+            if (defined($oldconf) && $oldconf->{$opt}) {
+                $old_features = PVE::LXC::Config->parse_features($oldconf->{$opt});
+            }
+            my $new_features = {};
             if (!$delete) {
-                my $features = PVE::LXC::Config->parse_features($newconf->{$opt});
-                if (defined($oldconf) && $oldconf->{$opt}) {
-                    # existing container with features
-                    my $old_features = PVE::LXC::Config->parse_features($oldconf->{$opt});
-                    for my $feature ((keys %$old_features, keys %$features)) {
-                        my $old = $old_features->{$feature} // '';
-                        my $new = $features->{$feature} // '';
-                        if ($old ne $new) {
-                            if ($feature eq 'nesting') {
-                                $nesting_changed = 1;
-                                next;
-                            } else {
-                                $other_changed = 1;
-                                last;
-                            }
-                        }
-                    }
+                $new_features = PVE::LXC::Config->parse_features($newconf->{$opt});
+            }
+
+            my $changed_features = get_changed_feature_flags($old_features, $new_features);
+
+            my $other_changed = grep { !$feature_flags_with_privilege->{$_} } @$changed_features;
+            raise_perm_exc(
+                "changing feature flags (except nesting and keyctl) is only allowed for root\@pam"
+            ) if $other_changed;
+
+            my $nesting_changed = grep { $_ eq 'nesting' } @$changed_features;
+            if ($nesting_changed) {
+                if ($unprivileged) {
+                    # VM.Allocate was the only requirement for unprivileged containers before
+                    # VM.Config.Nesting existed and stays accepted for compatibility.
+                    $rpcenv->check_vm_perm(
+                        $authuser, $vmid, $pool, ['VM.Allocate', 'VM.Config.Nesting'], 1,
+                    );
                 } else {
-                    # new container or no features defined
-                    if (scalar(keys %$features) == 1 && exists($features->{nesting})) {
-                        $nesting_changed = 1;
-                    } elsif (scalar(keys %$features) > 0) {
-                        $other_changed = 1;
-                    }
-                }
-            } else {
-                my $features = PVE::LXC::Config->parse_features($oldconf->{$opt});
-                if (scalar(keys %$features) == 1 && exists($features->{nesting})) {
-                    $nesting_changed = 1;
-                } elsif (scalar(keys %$features) > 0) {
-                    $other_changed = 1;
+                    $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Nesting']);
                 }
             }
-            raise_perm_exc(
-                "changing feature flags (except nesting) is only allowed for root\@pam")
-                if $other_changed;
-            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Allocate'])
-                if $nesting_changed;
+
+            my $keyctl_changed = grep { $_ eq 'keyctl' } @$changed_features;
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.Keyctl'])
+                if $keyctl_changed;
+        } elsif ($opt eq 'bpfdelegate') {
+            raise_perm_exc("bpfdelegate is only allowed for unprivileged containers")
+                if !$unprivileged && !$delete;
+
+            my $old_delegate = {};
+            if (defined($oldconf) && $oldconf->{$opt}) {
+                $old_delegate = PVE::LXC::Config->parse_bpf_delegate($oldconf->{$opt});
+            }
+            my $new_delegate = {};
+            if (!$delete) {
+                $new_delegate = PVE::LXC::Config->parse_bpf_delegate($newconf->{$opt});
+            }
+
+            my $privileges = get_changed_bpf_delegate_privileges($old_delegate, $new_delegate);
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, $privileges) if @$privileges;
+        } elsif ($opt =~ m/^hostnic\d+$/) {
+            $rpcenv->check_vm_perm($authuser, $vmid, $pool, ['VM.Config.HostNIC']);
+
+            my $links = {};
+            if (defined($oldconf) && $oldconf->{$opt}) {
+                my $old_hostnic = PVE::LXC::Config->parse_hostnic($oldconf->{$opt});
+                $links->{ $old_hostnic->{link} } = 1;
+            }
+            if (!$delete && defined($newconf->{$opt})) {
+                my $new_hostnic = PVE::LXC::Config->parse_hostnic($newconf->{$opt});
+                $links->{ $new_hostnic->{link} } = 1;
+            }
+            for my $link (sort keys %$links) {
+                $rpcenv->check($authuser, "/hostnic/$link", ['Sys.HostNIC.Use']);
+            }
         } elsif ($opt eq 'hookscript') {
             # For now this is restricted to root@pam
             raise_perm_exc("changing the hookscript is only allowed for root\@pam");
@@ -2441,6 +2595,172 @@ sub device_passthrough_hotplug : prototype($$$) {
     ]);
 }
 
+my $CLONE_FS = 0x0000_0200;
+my $SYS_PIDFD_OPEN = 434;
+my $SYS_PIDFD_GETFD = 438;
+my $BPF_DELEGATE_MOUNT_TARGET = '/sys/fs/bpf';
+my $BPF_DELEGATE_MOUNT_OPTIONS = {
+    cmds => 'delegate_cmds',
+    maps => 'delegate_maps',
+    progs => 'delegate_progs',
+    attachs => 'delegate_attachs',
+};
+
+# LXC appends arguments that are not delegation lists. Ignore those arguments.
+sub parse_bpf_delegate_hook_args {
+    my (@args) = @_;
+
+    my $lists = {};
+    for my $arg (@args) {
+        next if $arg !~ m/^(cmds|maps|progs|attachs)=([a-z0-9_:]+)\z/;
+        my ($kind, $kernel_list) = ($1, $2);
+        my $config_list = join(';', split(/:/, $kernel_list));
+        PVE::LXC::Config::verify_bpf_delegate_list($kind, $config_list);
+        $lists->{$kind} = $kernel_list;
+    }
+    return $lists;
+}
+
+# The BPF filesystem context must use the container's user namespace.
+# The child opens that context after entering the container namespaces.
+# The parent duplicates the descriptor with pidfd_getfd, sets delegate_* options,
+# and creates the mount with host privileges. It enters the container's mount
+# namespace after fsmount succeeds.
+sub bpf_delegate_mount {
+    my ($lxc_pid, $lists) = @_;
+
+    sysopen(my $ct_user_ns, "/proc/$lxc_pid/ns/user", O_RDONLY)
+        or die "failed to open user namespace of init process $lxc_pid: $!\n";
+    sysopen(my $ct_mnt_ns, "/proc/$lxc_pid/ns/mnt", O_RDONLY)
+        or die "failed to open mount namespace of init process $lxc_pid: $!\n";
+
+    pipe(my $reply_reader, my $reply_writer) or die "pipe failed: $!\n";
+    pipe(my $release_reader, my $release_writer) or die "pipe failed: $!\n";
+
+    my $child_pid = fork();
+    die "fork failed: $!\n" if !defined($child_pid);
+
+    if ($child_pid == 0) {
+        close($reply_reader);
+        close($release_writer);
+
+        my $exit_code = 1;
+        eval {
+            PVE::Tools::setns(fileno($ct_user_ns), PVE::Tools::CLONE_NEWUSER)
+                or die "failed to enter the container user namespace: $!\n";
+            PVE::Tools::setns(fileno($ct_mnt_ns), PVE::Tools::CLONE_NEWNS)
+                or die "failed to enter the container mount namespace: $!\n";
+            my $fs_context = PVE::Tools::fsopen('bpf', &FSOPEN_CLOEXEC)
+                or die "fsopen of bpf failed: $!\n";
+
+            my $reply = "fd " . fileno($fs_context) . "\n";
+            syswrite($reply_writer, $reply) or die "failed to write to the parent: $!\n";
+
+            # The child must stay alive until the parent duplicates the filesystem context
+            # descriptor.
+            my $unused = <$release_reader>;
+            $exit_code = 0;
+        };
+        if (my $err = $@) {
+            syswrite($reply_writer, "error $err");
+        }
+        POSIX::_exit($exit_code);
+    }
+
+    close($reply_writer);
+    close($release_reader);
+
+    my $result = eval {
+        my $reply = <$reply_reader>;
+        die "the child process exited before it opened the bpf fs context\n"
+            if !defined($reply);
+        chomp($reply);
+        die "child process: $1\n" if $reply =~ m/^error (.*)\z/;
+        die "unexpected reply '$reply' from the child process\n" if $reply !~ m/^fd (\d+)\z/;
+        my $child_fd = int($1);
+
+        my $child_pidfd = PVE::Syscall::file_handle_result(syscall($SYS_PIDFD_OPEN, $child_pid, 0))
+            or die "pidfd_open of child process $child_pid failed: $!\n";
+        my $fs_context = PVE::Syscall::file_handle_result(
+            syscall($SYS_PIDFD_GETFD, fileno($child_pidfd), $child_fd, 0),
+        ) or die "pidfd_getfd of the bpf fs context failed: $!\n";
+
+        for my $kind (@{ PVE::AccessControl::bpf_delegate_kinds() }) {
+            next if !$lists->{$kind};
+            my $option = $BPF_DELEGATE_MOUNT_OPTIONS->{$kind};
+            my $value = $lists->{$kind};
+            PVE::Tools::fsconfig(fileno($fs_context), &FSCONFIG_SET_STRING, $option, $value, 0)
+                or die "fsconfig $option=$value failed: $!\n";
+        }
+        PVE::Tools::fsconfig(fileno($fs_context), &FSCONFIG_CMD_CREATE, 0, 0, 0)
+            or die "fsconfig create of the bpf fs context failed: $!\n";
+        my $mount_fd = PVE::Tools::fsmount(fileno($fs_context), &FSMOUNT_CLOEXEC, 0)
+            or die "fsmount of the bpf fs context failed: $!\n";
+
+        # setns on a mount namespace needs an fs_struct that this process does not share.
+        PVE::Tools::unshare($CLONE_FS) or die "unshare of the fs_struct failed: $!\n";
+
+        # Verify the mount namespace after the helper calls setns.
+        # The helper does not report setns failures.
+        my ($ns_dev, $ns_ino) = (stat($ct_mnt_ns))[0, 1];
+        opendir(my $host_proc_dir, '/proc/self')
+            or die "failed to open the host process directory: $!\n";
+        # The lxc-start AppArmor profile permits transitions to lxc-* profiles.
+        # The lxc-pve-overlay-mount profile permits the BPF mount operation.
+        $enter_mnt_ns_and_change_aa_profile->($ct_mnt_ns, "lxc-pve-overlay-mount");
+        chdir($host_proc_dir) or die "failed to change to the host process directory: $!\n";
+        my ($current_dev, $current_ino) = (stat('ns/mnt'))[0, 1];
+        chdir('/')
+            or die "failed to change directory within the container mount namespace: $!\n";
+        die "failed to enter the container mount namespace\n"
+            if !defined($current_ino) || $ns_dev != $current_dev || $ns_ino != $current_ino;
+
+        my $target = $BPF_DELEGATE_MOUNT_TARGET;
+        PVE::Tools::move_mount(
+            fileno($mount_fd), '', &AT_FDCWD, $target, &MOVE_MOUNT_F_EMPTY_PATH,
+        ) or die "move_mount to $target failed: $!\n";
+        1;
+    };
+    my $err = $@;
+
+    close($release_writer);
+    waitpid($child_pid, 0);
+    my $child_status = $?;
+
+    die $err if !$result;
+    die "child process exited with status $child_status\n" if $child_status != 0;
+    return;
+}
+
+# lxc.hook.start-host invokes this entry point with the container ID and configured lists.
+# A failure prints to stderr, attempts to append /run/pve/ct-<vmid>.warnings,
+# and exits with status 1.
+sub bpf_delegate_start_host {
+    my ($vmid, @args) = @_;
+
+    eval {
+        my $lxc_pid = $ENV{LXC_PID};
+        die "LXC_PID is not set\n" if !defined($lxc_pid) || $lxc_pid !~ m/^(\d+)\z/;
+        $lxc_pid = int($1);
+
+        my $lists = parse_bpf_delegate_hook_args(@args);
+        bpf_delegate_mount($lxc_pid, $lists);
+    };
+    if (my $err = $@) {
+        chomp($err);
+        my $message = "bpfdelegate: $err\n";
+        print STDERR $message;
+        if (defined($vmid) && $vmid =~ m/^(\d+)\z/) {
+            my $warnings_file = "/run/pve/ct-$1.warnings";
+            if (open(my $fh, '>>', $warnings_file)) {
+                print {$fh} $message;
+                close($fh);
+            }
+        }
+        exit(1);
+    }
+}
+
 sub mountpoint_hotplug : prototype($$$$$) {
     my ($vmid, $conf, $opt, $mp, $storage_cfg) = @_;
 
@@ -3157,6 +3477,9 @@ sub vm_start {
         $conf = PVE::LXC::Config->load_config($vmid); # update/reload
     }
 
+    my $attachment_lock = lock_hostnics_for_start($conf);
+    check_hostnic_links($conf, '/sys/class/net');
+
     update_lxc_config($vmid, $conf);
 
     eval {
@@ -3192,7 +3515,13 @@ sub vm_start {
     eval {
         run_command($cmd);
 
-        monitor_start($monitor_socket, $vmid) if defined($monitor_socket);
+        if ($attachment_lock) {
+            # liblxc moves physical interfaces into the namespace before publishing RUNNING.
+            run_command(['/usr/bin/lxc-wait', '-n', $vmid, '-s', 'RUNNING', '-t', '60']);
+            find_lxc_pid($vmid);
+        } elsif (defined($monitor_socket)) {
+            monitor_start($monitor_socket, $vmid);
+        }
 
         # if debug is requested, print the log it also when the start succeeded
         print_ct_stderr_log($vmid) if $is_debug;
@@ -3201,8 +3530,21 @@ sub vm_start {
     print_ct_warn_log($vmid); # always print warn log, if any
     if ($err) {
         unlink $skiplock_flag_fn;
+        if ($attachment_lock) {
+            eval {
+                my $unit = "$base_unit\@$vmid.service";
+                run_command(['systemctl', 'stop', $unit]);
+                my $state;
+                run_command(['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
+                    outfunc => sub { $state = shift });
+                die "Container unit $unit did not stop.\n"
+                    if !defined($state) || $state !~ /\A(?:inactive|failed)\z/ || check_running($vmid);
+            };
+            die "$err\nCould not finish stopping container $vmid: $@" if $@;
+        }
         die $err;
     }
+    undef $attachment_lock;
     PVE::GuestHelpers::exec_hookscript($conf, $vmid, 'post-start');
 
     my @managed_dhcpv4_interfaces = ();

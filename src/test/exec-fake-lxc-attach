@@ -1,0 +1,8 @@
+#!/bin/bash
+# Test replacement for lxc-attach on a host without containers. It runs the arguments that
+# follow the double dash on the test host.
+while [[ "$1" != "--" ]]; do
+    shift
+done
+shift
+exec "$@"

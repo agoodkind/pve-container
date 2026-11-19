@@ -1,4 +1,4 @@
-SOURCES=LXC.pm
+SOURCES=LXC.pm GuestExecResult.pm
 
 .PHONY: install
 install: $(SOURCES)

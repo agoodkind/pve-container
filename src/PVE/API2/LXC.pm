@@ -3,6 +3,11 @@ package PVE::API2::LXC;
 use strict;
 use warnings;
 
+use IO::Select;
+use MIME::Base64 qw(decode_base64 encode_base64);
+use POSIX qw(WNOHANG SIGCHLD SIG_BLOCK SIG_UNBLOCK SIG_SETMASK sigprocmask);
+use Time::HiRes (); # Guest exec also runs on packages that do not import usleep.
+
 use Fcntl qw(F_GETFD F_SETFD FD_CLOEXEC);
 use IO::Socket::UNIX;
 use Socket qw(SOCK_STREAM);
@@ -20,6 +25,7 @@ use PVE::INotify;
 use PVE::JSONSchema qw(get_standard_option);
 use PVE::RESTHandler;
 use PVE::RPCEnvironment;
+use PVE::GuestExecResult;
 use PVE::RRD;
 use PVE::RS::OCI;
 use PVE::ReplicationConfig;
@@ -784,6 +790,11 @@ __PACKAGE__->register_method({
             { subdir => 'snapshot' },
             { subdir => 'resize' },
             { subdir => 'interfaces' },
+            { subdir => 'exec' },
+            { subdir => 'exec-status' },
+            { subdir => 'exec-ack' },
+            { subdir => 'file-read' },
+            { subdir => 'file-write' },
         ];
 
         return $res;
@@ -3153,6 +3164,618 @@ __PACKAGE__->register_method({
         my ($param) = @_;
 
         return PVE::LXC::get_interfaces($param->{vmid});
+    },
+});
+
+# pve-http-server rejects a request body above 512 KiB ($limit_max_post in
+# PVE/APIServer/AnyEvent.pm). A form-encoded body expands each of '+', '/', and '=' to three
+# bytes. The worst case body of a 128 KiB base64 value is 384 KiB.
+my $GUEST_BASE64_MAX_LENGTH = 128 * 1024;
+my $GUEST_BASE64_REGEX = qr{(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?};
+my $GUEST_EXEC_TIMEOUT_DEFAULT = 120;
+my $GUEST_EXEC_TIMEOUT_MAX = 3600;
+my $GUEST_EXEC_OUTPUT_LIMIT = PVE::GuestExecResult::output_limit();
+my $GUEST_FILE_READ_LIMIT = 4 * 1024 * 1024;
+my $GUEST_FILE_TIMEOUT = 60;
+my $GUEST_FILE_PATH_MAX_LENGTH = 4096;
+my $GUEST_KILL_GRACE_SECONDS = 5;
+my $GUEST_POLL_MICROSECONDS = 50_000;
+my $GUEST_IO_CHUNK_SIZE = 64 * 1024;
+my $GUEST_EXEC_TIMEOUT_EXITCODE = 124;
+
+my $decode_guest_base64 = sub {
+    my ($name, $value) = @_;
+
+    die "parameter '$name' is not valid base64\n" if $value !~ m/\A$GUEST_BASE64_REGEX\z/;
+    return decode_base64($value);
+};
+
+# $check_guest_file_path returns an absolute path without Perl's taint flag.
+my $check_guest_file_path = sub {
+    my ($file) = @_;
+
+    die "parameter 'file' must be an absolute path\n" if $file !~ m!\A(/[^\0]*)\z!s;
+    return $1;
+};
+
+# Perl's taint mode rejects tainted arguments to mkdir, chmod, unlink, and exec.
+# $untaint_decimal returns the validated decimal without the taint flag.
+my $untaint_decimal = sub {
+    my ($name, $value) = @_;
+
+    die "parameter '$name' is not a decimal number\n" if !defined($value) || $value !~ m/\A(\d+)\z/;
+    return $1;
+};
+
+# The API has validated the command and its arguments, and lxc-attach receives each one as a
+# single argument.
+my $untaint_command = sub {
+    my ($command) = @_;
+
+    my @untainted;
+    for my $argument (@$command) {
+        die "a command argument contains a NUL byte\n" if $argument !~ m/\A([^\0]*)\z/s;
+        push @untainted, $1;
+    }
+    return \@untainted;
+};
+
+my $assert_container_running = sub {
+    my ($vmid) = @_;
+
+    PVE::LXC::Config->load_config($vmid); # test if container exists on this node
+    die "container '$vmid' not running!\n" if !PVE::LXC::check_running($vmid);
+};
+
+# Sends TERM, then KILL after the grace period, to the process group of lxc-attach. A command
+# that calls setsid itself leaves the group and keeps running.
+my $terminate_attach_process = sub {
+    my ($pid) = @_;
+
+    kill('TERM', -$pid);
+    my $reaped = 0;
+    my $grace_deadline = Time::HiRes::time() + $GUEST_KILL_GRACE_SECONDS;
+    while (Time::HiRes::time() < $grace_deadline) {
+        $reaped = 1 if !$reaped && waitpid($pid, WNOHANG) != 0;
+        # The kernel keeps the group number in use while a member exists. The check of the
+        # group ends when the last member has exited.
+        return if $reaped && !kill(0, -$pid);
+        Time::HiRes::usleep($GUEST_POLL_MICROSECONDS);
+    }
+    kill('KILL', -$pid);
+    waitpid($pid, 0) if !$reaped;
+};
+
+# Starts lxc-attach as the leader of a new process group. A timeout then signals the command
+# and the processes that it forks. Returns the process ID and the handles for the standard
+# input, output, and error of the process.
+my $start_attach_process = sub {
+    my ($attach_command) = @_;
+
+    pipe(my $stdin_read, my $stdin_write) or die "pipe failed: $!\n";
+    pipe(my $stdout_read, my $stdout_write) or die "pipe failed: $!\n";
+    pipe(my $stderr_read, my $stderr_write) or die "pipe failed: $!\n";
+
+    my $pid = fork();
+    die "fork failed: $!\n" if !defined($pid);
+
+    if (!$pid) {
+        # An ignored signal stays ignored after exec, and the command in the container must
+        # start with the default handling.
+        for my $signal (qw(PIPE TTOU INT QUIT TERM)) {
+            $SIG{$signal} = 'DEFAULT';
+        }
+        setpgrp(0, 0);
+        close($stdin_write);
+        close($stdout_read);
+        close($stderr_read);
+        open(STDIN, '<&', $stdin_read) or POSIX::_exit(126);
+        open(STDOUT, '>&', $stdout_write) or POSIX::_exit(126);
+        open(STDERR, '>&', $stderr_write) or POSIX::_exit(126);
+        exec { $attach_command->[0] } @$attach_command or do {
+            print STDERR "unable to execute $attach_command->[0]: $!\n";
+            POSIX::_exit(127);
+        };
+    }
+
+    close($stdin_read);
+    close($stdout_write);
+    close($stderr_write);
+    return ($pid, $stdin_write, $stdout_read, $stderr_read);
+};
+
+# $run_in_container starts lxc-attach as root and captures raw stdout and stderr.
+# It returns the exit code, captured output, truncation flags, and timeout flag in that order.
+# A command that exceeds the timeout returns exit code 124.
+my $run_in_container = sub {
+    my ($vmid, $command, $input, $timeout, $output_limit) = @_;
+
+    $vmid = $untaint_decimal->('vmid', $vmid);
+    $timeout = $untaint_decimal->('timeout', $timeout);
+    $command = $untaint_command->($command);
+    $assert_container_running->($vmid);
+
+    # A command that stops reading its standard input must not terminate pvedaemon with SIGPIPE.
+    local $SIG{PIPE} = 'IGNORE';
+
+    my $attach_command = ['lxc-attach', '-n', $vmid, '--clear-env', '--', @$command];
+
+    my ($pid, $stdin_handle, $stdout_handle, $stderr_handle) =
+        $start_attach_process->($attach_command);
+
+    my $stdout_fileno = fileno($stdout_handle);
+    my $read_select = IO::Select->new($stdout_handle, $stderr_handle);
+    my $write_select = IO::Select->new();
+    my $pending_input = $input // '';
+    if (length($pending_input)) {
+        $stdin_handle->blocking(0);
+        $write_select->add($stdin_handle);
+    } else {
+        close($stdin_handle);
+    }
+
+    my $captured = { stdout => '', stderr => '' };
+    my $truncated = { stdout => 0, stderr => 0 };
+    my $deadline = Time::HiRes::time() + $timeout;
+    my $timed_out = 0;
+
+    while ($read_select->count() || $write_select->count()) {
+        my $remaining = $deadline - Time::HiRes::time();
+        if ($remaining <= 0) {
+            $timed_out = 1;
+            last;
+        }
+
+        my ($readable, $writable) =
+            IO::Select->select($read_select, $write_select, undef, $remaining);
+        next if !$readable;
+
+        for my $handle (@$writable) {
+            my $written = syswrite($handle, $pending_input, $GUEST_IO_CHUNK_SIZE);
+            if (defined($written)) {
+                substr($pending_input, 0, $written, '');
+            } elsif ($!{EAGAIN} || $!{EINTR}) {
+                next;
+            } else {
+                $pending_input = '';
+            }
+            if (!length($pending_input)) {
+                $write_select->remove($handle);
+                close($handle);
+            }
+        }
+
+        for my $handle (@$readable) {
+            my $stream = 'stderr';
+            if (fileno($handle) == $stdout_fileno) {
+                $stream = 'stdout';
+            }
+
+            my $count = sysread($handle, my $buffer, $GUEST_IO_CHUNK_SIZE);
+            if (!defined($count)) {
+                next if $!{EAGAIN} || $!{EINTR};
+                $count = 0;
+            }
+            if ($count == 0) {
+                $read_select->remove($handle);
+                close($handle);
+                next;
+            }
+
+            my $space = $output_limit - length($captured->{$stream});
+            if ($count > $space) {
+                $truncated->{$stream} = 1;
+                $count = $space;
+            }
+            $captured->{$stream} .= substr($buffer, 0, $count);
+        }
+    }
+
+    # The command can close its output streams and keep running.
+    my $child_status;
+    while (!$timed_out) {
+        my $reaped = waitpid($pid, WNOHANG);
+        if ($reaped == $pid) {
+            $child_status = $?;
+            last;
+        }
+        die "waiting for the command in container '$vmid' failed: $!\n" if $reaped < 0;
+
+        $timed_out = 1 if Time::HiRes::time() >= $deadline;
+        Time::HiRes::usleep($GUEST_POLL_MICROSECONDS);
+    }
+
+    if ($timed_out) {
+        for my $handle ($read_select->handles(), $write_select->handles()) {
+            close($handle);
+        }
+        $terminate_attach_process->($pid);
+        return ($GUEST_EXEC_TIMEOUT_EXITCODE, $captured, $truncated, 1);
+    }
+
+    my $exitcode = $child_status >> 8;
+    if (my $signal = $child_status & 127) {
+        $exitcode = 128 + $signal;
+    }
+
+    return ($exitcode, $captured, $truncated, 0);
+};
+
+my $run_exec_worker = sub {
+    my ($vmid, $exec_id, $command, $input, $timeout) = @_;
+
+    PVE::GuestExecResult::worker_started('lxc', $vmid, $exec_id);
+    my $status = {};
+    my $captured = { stdout => '', stderr => '' };
+    eval {
+        my ($exitcode, $output, $truncated, $timed_out) =
+            $run_in_container->($vmid, $command, $input, $timeout, $GUEST_EXEC_OUTPUT_LIMIT);
+        $captured = $output;
+        $status->{exitcode} = 0 + $exitcode;
+        $status->{'out-truncated'} = 1 if $truncated->{stdout};
+        $status->{'err-truncated'} = 1 if $truncated->{stderr};
+        $status->{'timed-out'} = 1 if $timed_out;
+    };
+    if (my $error = $@) {
+        chomp($error);
+        $status = { error => $error };
+    }
+
+    PVE::GuestExecResult::complete('lxc', $vmid, $exec_id, $status, $captured);
+    die "command timed out after $timeout seconds\n" if $status->{'timed-out'};
+};
+
+__PACKAGE__->register_method({
+    name => 'exec',
+    path => '{vmid}/exec',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    expose_credentials => 1,
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
+    },
+    description => 'Start a command as root in a running container and return its identifier at'
+        . ' once. Poll exec-status for the result.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            command => {
+                type => 'array',
+                description => 'The command as a list of program and arguments.',
+                minItems => 1,
+                items => {
+                    type => 'string',
+                    description => 'One part of the program and arguments.',
+                },
+            },
+            'input-data' => {
+                type => 'string',
+                maxLength => $GUEST_BASE64_MAX_LENGTH,
+                description => 'Base64 encoded data for the standard input of the command.',
+                optional => 1,
+            },
+            timeout => {
+                type => 'integer',
+                minimum => 1,
+                maximum => $GUEST_EXEC_TIMEOUT_MAX,
+                default => $GUEST_EXEC_TIMEOUT_DEFAULT,
+                description => 'Seconds until the command is stopped.',
+                optional => 1,
+            },
+            'result-retention' => {
+                type => 'string',
+                enum => ['acknowledged'],
+                default => 'acknowledged',
+                optional => 1,
+                description => 'Retain completed results until acknowledgment or expiry.',
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            pid => {
+                type => 'integer',
+                description => 'The identifier of the command for exec-status. It is a random'
+                    . ' number, not a process ID.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        # rest_handler stores the authenticated user of this request in the credentials
+        # immediately before it calls the method. The user of the environment can belong to
+        # another request or be empty, because auth_handler sets it before the body arrives and
+        # every request clears it.
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $credentials = $rpcenv->get_credentials(1) // {};
+        my $authuser = $credentials->{userid};
+        die "the authenticated user of the request is not available to exec\n"
+            if !defined($authuser);
+
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $input;
+        if (defined($param->{'input-data'})) {
+            $input = $decode_guest_base64->('input-data', $param->{'input-data'});
+        }
+        my $timeout =
+            $untaint_decimal->('timeout', $param->{timeout} // $GUEST_EXEC_TIMEOUT_DEFAULT);
+        my $command = $untaint_command->($param->{command});
+
+        $assert_container_running->($vmid);
+        my $exec_id = PVE::GuestExecResult::reserve('lxc', $vmid);
+
+        # fork_worker waits for the worker with a read that a SIGCHLD from an earlier worker
+        # interrupts, and then fails with "got no worker upid". SIGCHLD stays blocked until
+        # fork_worker returns, and the signal arrives afterwards.
+        my $sigchld = POSIX::SigSet->new(SIGCHLD);
+        my $previous_signals = POSIX::SigSet->new();
+        sigprocmask(SIG_BLOCK, $sigchld, $previous_signals)
+            or die "unable to block SIGCHLD: $!\n";
+        eval {
+            $rpcenv->fork_worker(
+                'lxcexec',
+                $vmid,
+                $authuser,
+                sub {
+                    # The worker inherits the blocked signal and unblocks it before starting
+                    # lxc-attach.
+                    sigprocmask(SIG_UNBLOCK, $sigchld);
+                    $run_exec_worker->($vmid, $exec_id, $command, $input, $timeout);
+                },
+            );
+        };
+        my $fork_error = $@;
+        sigprocmask(SIG_SETMASK, $previous_signals);
+        die $fork_error if $fork_error;
+
+        return { pid => 0 + $exec_id };
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'exec_status',
+    path => '{vmid}/exec-status',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
+    },
+    description => 'Read a command result until exec-ack deletes it or one hour passes.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            pid => {
+                type => 'integer',
+                minimum => 1,
+                description => 'The identifier that exec returned.',
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            exited => {
+                type => 'boolean',
+                description => 'Set to 1 when the command has exited.',
+            },
+            exitcode => {
+                type => 'integer',
+                optional => 1,
+                description => 'The exit code of the command, or 128 plus the signal number'
+                    . " when a signal ended it. A command that exceeded its timeout has"
+                    . " $GUEST_EXEC_TIMEOUT_EXITCODE.",
+            },
+            'timed-out' => {
+                type => 'boolean',
+                optional => 1,
+                description => 'Set when the command exceeded its timeout and was stopped.',
+            },
+            'out-data' => {
+                type => 'string',
+                optional => 1,
+                description => 'Base64 encoded standard output of the command.',
+            },
+            'err-data' => {
+                type => 'string',
+                optional => 1,
+                description => 'Base64 encoded standard error of the command.',
+            },
+            'out-truncated' => {
+                type => 'boolean',
+                optional => 1,
+                description => "Set when the standard output exceeded $GUEST_EXEC_OUTPUT_LIMIT"
+                    . ' bytes.',
+            },
+            'err-truncated' => {
+                type => 'boolean',
+                optional => 1,
+                description => "Set when the standard error exceeded $GUEST_EXEC_OUTPUT_LIMIT"
+                    . ' bytes.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $exec_id = $untaint_decimal->('pid', $param->{pid});
+
+        return PVE::GuestExecResult::read('lxc', $vmid, $exec_id);
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'exec_ack',
+    path => '{vmid}/exec-ack',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.Exec']],
+    },
+    description => 'Acknowledge receipt and delete a completed command result.'
+        . ' Repeated acknowledgment succeeds.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid', { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            pid => {
+                type => 'integer',
+                minimum => 1,
+                description => 'The identifier that exec returned.',
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $exec_id = $untaint_decimal->('pid', $param->{pid});
+        return PVE::GuestExecResult::acknowledge('lxc', $vmid, $exec_id);
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'file_write',
+    path => '{vmid}/file-write',
+    method => 'POST',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.FileWrite']],
+    },
+    description => 'Write a file as root in a running container. An existing file is replaced.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            file => {
+                type => 'string',
+                maxLength => $GUEST_FILE_PATH_MAX_LENGTH,
+                description => 'The absolute path of the file in the container.',
+            },
+            content => {
+                type => 'string',
+                maxLength => $GUEST_BASE64_MAX_LENGTH,
+                description => 'The base64 encoded content of the file.',
+            },
+        },
+    },
+    returns => { type => 'null' },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $file = $check_guest_file_path->($param->{file});
+        my $content = $decode_guest_base64->('content', $param->{content});
+
+        my ($exitcode, $captured, undef, $timed_out) = $run_in_container->(
+            $vmid, ['tee', '--', $file], $content, $GUEST_FILE_TIMEOUT, $GUEST_IO_CHUNK_SIZE,
+        );
+
+        die "writing '$file' in container '$vmid' timed out\n" if $timed_out;
+        if ($exitcode != 0) {
+            my $error_message = $captured->{stderr};
+            chomp($error_message);
+            die "cannot write '$file' in container '$vmid': $error_message\n";
+        }
+
+        return;
+    },
+});
+
+__PACKAGE__->register_method({
+    name => 'file_read',
+    path => '{vmid}/file-read',
+    method => 'GET',
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => ['perm', '/vms/{vmid}', ['VM.Guest.FileRead']],
+    },
+    description =>
+        "Read a file as root in a running container. The read stops at $GUEST_FILE_READ_LIMIT"
+        . ' bytes.',
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node => get_standard_option('pve-node'),
+            vmid => get_standard_option(
+                'pve-vmid',
+                { completion => \&PVE::LXC::complete_ctid_running },
+            ),
+            file => {
+                type => 'string',
+                maxLength => $GUEST_FILE_PATH_MAX_LENGTH,
+                description => 'The absolute path of the file in the container.',
+            },
+        },
+    },
+    returns => {
+        type => 'object',
+        properties => {
+            content => {
+                type => 'string',
+                description => 'The base64 encoded content of the file.',
+            },
+            truncated => {
+                type => 'boolean',
+                optional => 1,
+                description => 'Set when the file is larger than the read limit.',
+            },
+        },
+    },
+    code => sub {
+        my ($param) = @_;
+
+        my $vmid = $untaint_decimal->('vmid', $param->{vmid});
+        my $file = $check_guest_file_path->($param->{file});
+
+        # One byte beyond the limit shows that the file is larger.
+        my $read_size = $GUEST_FILE_READ_LIMIT + 1;
+        my ($exitcode, $captured, undef, $timed_out) = $run_in_container->(
+            $vmid, ['head', '-c', $read_size, '--', $file], undef, $GUEST_FILE_TIMEOUT,
+            $read_size,
+        );
+
+        die "reading '$file' in container '$vmid' timed out\n" if $timed_out;
+        if ($exitcode != 0) {
+            my $error_message = $captured->{stderr};
+            chomp($error_message);
+            die "cannot read '$file' in container '$vmid': $error_message\n";
+        }
+
+        my $content = $captured->{stdout};
+        my $result = {};
+        if (length($content) > $GUEST_FILE_READ_LIMIT) {
+            $content = substr($content, 0, $GUEST_FILE_READ_LIMIT);
+            $result->{truncated} = 1;
+        }
+        $result->{content} = encode_base64($content, '');
+
+        return $result;
     },
 });
 
