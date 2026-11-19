@@ -739,6 +739,13 @@ sub make_hostnic_config {
     return $raw;
 }
 
+sub lock_hostnics_for_start {
+    my ($conf) = @_;
+    return undef if !grep { /\Ahostnic\d+\z/ } keys %$conf;
+    require PVE::SRIOVLock;
+    return PVE::SRIOVLock::lock_attachment();
+}
+
 sub check_hostnic_links {
     my ($conf, $net_dir) = @_;
 
@@ -3469,6 +3476,7 @@ sub vm_start {
         $conf = PVE::LXC::Config->load_config($vmid); # update/reload
     }
 
+    my $attachment_lock = lock_hostnics_for_start($conf);
     check_hostnic_links($conf, '/sys/class/net');
 
     update_lxc_config($vmid, $conf);
@@ -3506,7 +3514,13 @@ sub vm_start {
     eval {
         run_command($cmd);
 
-        monitor_start($monitor_socket, $vmid) if defined($monitor_socket);
+        if ($attachment_lock) {
+            # liblxc moves physical interfaces into the namespace before publishing RUNNING.
+            run_command(['/usr/bin/lxc-wait', '-n', $vmid, '-s', 'RUNNING', '-t', '60']);
+            find_lxc_pid($vmid);
+        } elsif (defined($monitor_socket)) {
+            monitor_start($monitor_socket, $vmid);
+        }
 
         # if debug is requested, print the log it also when the start succeeded
         print_ct_stderr_log($vmid) if $is_debug;
@@ -3515,8 +3529,21 @@ sub vm_start {
     print_ct_warn_log($vmid); # always print warn log, if any
     if ($err) {
         unlink $skiplock_flag_fn;
+        if ($attachment_lock) {
+            eval {
+                my $unit = "$base_unit\@$vmid.service";
+                run_command(['systemctl', 'stop', $unit]);
+                my $state;
+                run_command(['systemctl', 'show', $unit, '-p', 'ActiveState', '--value'],
+                    outfunc => sub { $state = shift });
+                die "Container unit $unit did not stop.\n"
+                    if !defined($state) || $state !~ /\A(?:inactive|failed)\z/ || check_running($vmid);
+            };
+            die "$err\nCould not finish stopping container $vmid: $@" if $@;
+        }
         die $err;
     }
+    undef $attachment_lock;
     PVE::GuestHelpers::exec_hookscript($conf, $vmid, 'post-start');
 
     my @managed_dhcpv4_interfaces = ();
