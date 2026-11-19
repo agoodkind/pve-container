@@ -3453,12 +3453,13 @@ my sub monitor_state_change($$) {
         }
     }
 }
-my sub monitor_start($$) {
-    my ($monitor_socket, $vmid) = @_;
+my sub monitor_start($$$) {
+    my ($monitor_socket, $vmid, $attachment_lock) = @_;
 
     my $success =
         eval { PVE::Tools::run_with_timeout(10, \&monitor_state_change, $monitor_socket, $vmid) };
     if (my $err = $@) {
+        die "Cannot confirm startup for container $vmid: $err" if $attachment_lock;
         warn "problem with monitor socket, but continuing anyway: $err\n";
     } elsif (!$success) {
         print_ct_stderr_log($vmid);
@@ -3502,7 +3503,13 @@ sub vm_start {
     PVE::Storage::activate_volumes($storage_cfg, $vollist);
 
     my $monitor_socket = eval { PVE::LXC::Monitor::get_monitor_socket() };
-    warn $@ if $@;
+    if (my $err = $@) {
+        if ($attachment_lock) {
+            unlink $skiplock_flag_fn if $skiplock;
+            die "Cannot monitor startup for container $vmid: $err";
+        }
+        warn $err;
+    }
 
     unlink "/run/pve/ct-$vmid.stderr"; # systemd does not truncate log files
 
@@ -3515,13 +3522,8 @@ sub vm_start {
     eval {
         run_command($cmd);
 
-        if ($attachment_lock) {
-            # liblxc moves physical interfaces into the namespace before publishing RUNNING.
-            run_command(['/usr/bin/lxc-wait', '-n', $vmid, '-s', 'RUNNING', '-t', '60']);
-            find_lxc_pid($vmid);
-        } elsif (defined($monitor_socket)) {
-            monitor_start($monitor_socket, $vmid);
-        }
+        monitor_start($monitor_socket, $vmid, $attachment_lock) if defined($monitor_socket);
+        find_lxc_pid($vmid) if $attachment_lock;
 
         # if debug is requested, print the log it also when the start succeeded
         print_ct_stderr_log($vmid) if $is_debug;
